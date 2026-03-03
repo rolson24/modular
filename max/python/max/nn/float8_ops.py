@@ -35,7 +35,7 @@ def matmul_float4(
     weight_scale_2: TensorValue,
     float8_config: Float8Config,
 ) -> TensorValue:
-    """Computes x @ weight.T with modelopt NVFP4 quantization.
+    """Computes x @ weight.T with modelopt FP4 quantization.
 
     Args:
         x: The input tensor in bf16.
@@ -48,21 +48,27 @@ def matmul_float4(
     Returns:
         The output tensor in bf16.
     """
-    if not float8_config.is_nvfp4:
+    if not (float8_config.is_nvfp4 or float8_config.is_mxfp4):
         raise ValueError(
-            "matmul_float4 only supports modelopt NVFP4 quantization"
+            "matmul_float4 only supports modelopt NVFP4 or MXFP4 quantization"
         )
+    is_nvfp4 = float8_config.is_nvfp4
+    scales_type = DType.float8_e4m3fn if is_nvfp4 else DType.float8_e8m0fnu
+    sf_vector_size = 16 if is_nvfp4 else 32
 
     x, x_scales = quantize_dynamic_block_scaled_fp4(
         x,
         tensor_sf=1.0 / input_scale,
-        scales_type=DType.float8_e4m3fn,
+        scales_type=scales_type,
+        sf_vector_size=sf_vector_size,
         out_type=DType.uint8,  # fp4-e2m1fnX2
     )
 
     weight_scale = weight_scale.to(x.device)
     weight_scale = block_scales_interleave(
         weight_scale,
+        sf_vector_size=sf_vector_size,
+        scales_type=scales_type,
     )
 
     res = dynamic_block_scaled_matmul_fp4(
@@ -71,6 +77,7 @@ def matmul_float4(
         x_scales,
         weight_scale,
         tensor_sf=weight_scale_2 * input_scale,
+        sf_vector_size=sf_vector_size,
         out_type=DType.bfloat16,
     )
     return res
@@ -99,9 +106,9 @@ def matmul_float8(
     Returns:
         The output tensor.
     """
-    if float8_config.is_nvfp4:
+    if float8_config.is_nvfp4 or float8_config.is_mxfp4:
         raise ValueError(
-            "matmul_float8 does not support modelopt NVFP4 quantization"
+            "matmul_float8 does not support modelopt FP4 quantization"
         )
 
     weight, weight_scale = convert_weights_to_fp8_fnuz_if_needed(

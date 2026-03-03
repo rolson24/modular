@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import MutableSequence
 from typing import Any, cast
 
@@ -444,6 +445,7 @@ def fused_qkv_ragged_matmul_scaled_float4(
             for blockwise scaling is 5D e.g., [2, 34, 32, 4, 4]
         tensor_sf: Buffer-wise scaling factor equal to weight_scale_2 * input_scale (pre-quantization, non-inverted).
         kv_scales: TBD, used in NVFP4 KV cache, see: https://github.com/NVIDIA/TensorRT-LLM/blob/0ffa77af51b272ba27424564ed253096d6f0f11a/tensorrt_llm/_torch/modules/linear.py#L690
+        sf_vector_size: Scale vector size. ``16`` for NVFP4 or ``32`` for MXFP4.
         _output_dim: Optional output dimension. If not provided, the output
             dimension will be [n_heads * head_dim].
 
@@ -454,6 +456,23 @@ def fused_qkv_ragged_matmul_scaled_float4(
         raise ValueError(
             "expected input and wqkv to have the same dtype, but got"
             f" {input.dtype} and {wqkv.dtype}, respectively."
+        )
+    if input_scale.dtype != weight_scale.dtype:
+        raise ValueError(
+            "expected input_scale and weight_scale to have the same dtype, but got"
+            f" {input_scale.dtype} and {weight_scale.dtype}"
+        )
+
+    if sf_vector_size not in (16, 32):
+        raise ValueError("sf_vector_size must be 16 (NVFP4) or 32 (MXFP4)")
+    expected_scale_type = (
+        DType.float8_e4m3fn if sf_vector_size == 16 else DType.float8_e8m0fnu
+    )
+    if input_scale.dtype != expected_scale_type:
+        raise ValueError(
+            "scale dtype/sf_vector_size mismatch: expected "
+            f"{expected_scale_type} for sf_vector_size={sf_vector_size}, got"
+            f" {input_scale.dtype}"
         )
 
     input_rank_expected = 2
@@ -509,7 +528,7 @@ def fused_qkv_ragged_matmul_scaled_float4(
     assert kv_params.page_size is not None
     parameters: dict[str, int | str | DType] = {
         "dtype": DType.uint8,
-        "scale_type": DType.float8_e4m3fn,
+        "scale_type": expected_scale_type,
         "kv_type": kv_params.dtype,
         "SF_VECTOR_SIZE": sf_vector_size,
     }
@@ -3327,6 +3346,202 @@ def grouped_dynamic_scaled_nvfp4_matmul(
     return output
 
 
+def _dequantize_grouped_fp4_weights(
+    weight: TensorValue,
+    b_scales: TensorValue,
+    expert_scales: TensorValue,
+    sf_vector_size: int,
+) -> TensorValue:
+    """Dequantizes grouped FP4 expert weights to BF16."""
+    if not isinstance(weight.shape[0], StaticDim):
+        raise ValueError(
+            "weight.shape[0] (num_experts) must be statically known for FP4 fallback"
+        )
+    num_experts = int(weight.shape[0])
+    packed_k = weight.shape[2]
+    n_dim = weight.shape[1]
+
+    weights_per_expert = ops.split(weight, [1] * num_experts, axis=0)
+    scales_per_expert = ops.split(b_scales, [1] * num_experts, axis=0)
+    expert_scale_per_expert = ops.split(expert_scales, [1] * num_experts, axis=0)
+
+    dequantized_weights = []
+    for w_e, s_e, scale_e in zip(
+        weights_per_expert,
+        scales_per_expert,
+        expert_scale_per_expert,
+        strict=True,
+    ):
+        w_2d = w_e.reshape([n_dim, packed_k])
+        s_5d = s_e.reshape(
+            [
+                b_scales.shape[1],
+                b_scales.shape[2],
+                b_scales.shape[3],
+                b_scales.shape[4],
+                b_scales.shape[5],
+            ]
+        )
+        w_dequant = mxfp4_unpack(
+            w_2d,
+            s_5d,
+            sf_vector_size=sf_vector_size,
+            out_type=DType.bfloat16,
+        )
+        dequantized_weights.append(
+            w_dequant * scale_e.reshape([]).to(w_dequant.device)
+        )
+
+    return ops.stack(dequantized_weights, axis=0)
+
+
+def grouped_dynamic_scaled_mxfp4_matmul(
+    hidden_states: TensorValue,
+    weight: TensorValue,
+    a_scales: TensorValue,
+    b_scales: TensorValue,
+    expert_start_indices: TensorValue,
+    a_scale_offsets: TensorValue,
+    expert_ids: TensorValue,
+    expert_scales: TensorValue,
+    expert_usage_stats_host: TensorValue,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """Correctness-first grouped MXFP4 matmul fallback for MoE.
+
+    This fallback dequantizes packed FP4 activations/weights and runs the
+    existing grouped BF16 matmul kernel. It is intended for non-tcgen05 GPUs.
+    """
+    del a_scale_offsets  # Unused in fallback path; scales are contiguous.
+
+    if weight.rank != 3:
+        raise ValueError(f"expected weight of rank 3 but got {weight.rank}")
+    if hidden_states.rank != 2:
+        raise ValueError(
+            f"expected hidden_states of rank 2 but got {hidden_states.rank}"
+        )
+
+    weight_k = weight.shape[2]
+    hidden_k = hidden_states.shape[1]
+    if weight_k != hidden_k or weight.shape[0] != expert_ids.shape[0]:
+        raise ValueError(
+            "expected weight is of shape [num_experts, *, "
+            f"{hidden_k}] but got {weight.shape}"
+        )
+
+    if (hidden_states.dtype != DType.uint8) or (weight.dtype != DType.uint8):
+        raise TypeError(
+            "hidden_states and weight dtypes must be uint8 for MXFP4, but got "
+            f"{hidden_states.dtype}, {weight.dtype}"
+        )
+
+    if (a_scales.dtype != b_scales.dtype) or (
+        a_scales.dtype != DType.float8_e8m0fnu
+    ):
+        raise TypeError(
+            "a_scales and b_scales dtypes must be float8_e8m0fnu for MXFP4, "
+            f"but got {a_scales.dtype}, {b_scales.dtype}"
+        )
+
+    if expert_ids.dtype != DType.int32:
+        raise TypeError(
+            f"expert_ids dtype must be int32, but got {expert_ids.dtype}"
+        )
+    if expert_ids.rank != 1:
+        raise ValueError(
+            f"expected expert_ids of rank 1 but got {expert_ids.rank}"
+        )
+
+    if expert_start_indices.dtype != DType.uint32:
+        raise TypeError(
+            "expert_start_indices dtype must be uint32, but got"
+            f" {expert_start_indices.dtype}"
+        )
+    if expert_start_indices.rank != 1:
+        raise ValueError(
+            "expected expert_start_indices of rank 1 but got"
+            f" {expert_start_indices.rank}"
+        )
+
+    if a_scales.rank != 5 or b_scales.rank != 6:
+        raise ValueError(
+            "expected a_scales of rank 5 and b_scales of rank 6 but got"
+            f" {a_scales.rank} and {b_scales.rank}"
+        )
+
+    if expert_scales.dtype != DType.float32:
+        raise TypeError(
+            f"expert_scales dtype must be float32, but got {expert_scales.dtype}"
+        )
+    if expert_scales.rank != 1:
+        raise ValueError(
+            f"expected expert_scales of rank 1 but got {expert_scales.rank}"
+        )
+
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_VECTOR_SIZE = 32
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    SF_K_GROUP_SIZE = SF_ATOM_K * SF_VECTOR_SIZE
+
+    a_scales_dim_1 = ceildiv(hidden_states.shape[1] * 2, Dim(SF_K_GROUP_SIZE))
+    if (
+        a_scales.shape[1] != a_scales_dim_1
+        or a_scales.shape[2] != SF_ATOM_M[0]
+        or a_scales.shape[3] != SF_ATOM_M[1]
+        or a_scales.shape[4] != SF_ATOM_K
+    ):
+        raise ValueError(
+            "a_scales shape must be "
+            f"[*, {a_scales_dim_1}, {SF_ATOM_M[0]}, {SF_ATOM_M[1]}, {SF_ATOM_K}]"
+            f" but got {a_scales.shape}"
+        )
+
+    b_scales_dim_1 = ceildiv(weight.shape[1], Dim(SF_MN_GROUP_SIZE))
+    b_scales_dim_2 = ceildiv(weight.shape[2] * 2, Dim(SF_K_GROUP_SIZE))
+    if (
+        b_scales.shape[0] != weight.shape[0]
+        or b_scales.shape[1] != b_scales_dim_1
+        or b_scales.shape[2] != b_scales_dim_2
+        or b_scales.shape[3] != SF_ATOM_M[0]
+        or b_scales.shape[4] != SF_ATOM_M[1]
+        or b_scales.shape[5] != SF_ATOM_K
+    ):
+        raise ValueError(
+            "b_scales shape must be "
+            f"[{weight.shape[0]}, {b_scales_dim_1}, {b_scales_dim_2}, "
+            f"{SF_ATOM_M[0]}, {SF_ATOM_M[1]}, {SF_ATOM_K}] but got {b_scales.shape}"
+        )
+
+    assert_same_device(
+        hidden_states=hidden_states,
+        weight=weight,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        expert_start_indices=expert_start_indices,
+        expert_ids=expert_ids,
+        expert_scales=expert_scales,
+    )
+
+    hidden_dequant = mxfp4_unpack(
+        hidden_states,
+        a_scales,
+        sf_vector_size=SF_VECTOR_SIZE,
+        out_type=DType.bfloat16,
+    )
+    weight_dequant = _dequantize_grouped_fp4_weights(
+        weight, b_scales, expert_scales, sf_vector_size=SF_VECTOR_SIZE
+    )
+    output = grouped_matmul_ragged(
+        hidden_dequant,
+        weight_dequant,
+        expert_start_indices,
+        expert_ids,
+        expert_usage_stats_host.to(DeviceRef.CPU()),
+    )
+    return output if output.dtype == out_type else ops.cast(output, out_type)
+
+
 def grouped_dynamic_scaled_fp8_matmul(
     hidden_states: TensorValue,
     weight: TensorValue,
@@ -3903,7 +4118,7 @@ def dynamic_block_scaled_matmul_fp4(
     sf_vector_size: int = 16,
     out_type: DType = DType.bfloat16,
 ) -> TensorValue:
-    """Perform a matmul of two FP4 tensors with 1D-block scaled scaling factors.
+    """Perform a matmul of two FP4 tensors with 1D-block scaled factors.
 
     Args:
         a: The first tensor to multiply.
@@ -3934,11 +4149,24 @@ def dynamic_block_scaled_matmul_fp4(
     if a.dtype != DType.uint8:
         raise ValueError("A dtype must be uint8 (fp4-e2m1fnX2)")
 
-    if a_scales.dtype != DType.float8_e4m3fn:
-        raise ValueError("a_scales dtype must be float8_e4m3fn")
+    if a_scales.dtype not in (DType.float8_e4m3fn, DType.float8_e8m0fnu):
+        raise ValueError(
+            "a_scales dtype must be float8_e4m3fn (NVFP4) or"
+            " float8_e8m0fnu (MXFP4)"
+        )
 
-    if sf_vector_size != 16:
-        raise ValueError("sf_vector_size must be 16 for NVFP4")
+    if sf_vector_size not in (16, 32):
+        raise ValueError("sf_vector_size must be 16 (NVFP4) or 32 (MXFP4)")
+
+    expected_scale_dtype = (
+        DType.float8_e4m3fn if sf_vector_size == 16 else DType.float8_e8m0fnu
+    )
+    if a_scales.dtype != expected_scale_dtype:
+        raise ValueError(
+            "scales dtype/sf_vector_size mismatch: expected "
+            f"{expected_scale_dtype} for sf_vector_size={sf_vector_size}, got"
+            f" {a_scales.dtype}"
+        )
 
     SF_ATOM_M = [32, 4]
     SF_ATOM_K = 4
@@ -3991,7 +4219,27 @@ def dynamic_block_scaled_matmul_fp4(
             tensor_sf, DType.float32, device=DeviceRef.CPU()
         )
     else:
-        tensor_sf_value = TensorValue(tensor_sf)
+        tensor_sf_value = (
+            TensorValue(tensor_sf)
+            .cast(DType.float32)
+            .to(DeviceRef.CPU())
+            .reshape(())
+        )
+
+    if (
+        sf_vector_size == 32
+        and os.getenv("MAX_MXFP4_FORCE_REFERENCE", "0") == "1"
+    ):
+        # Debug/recovery escape hatch: force reference behavior for MXFP4.
+        return dynamic_block_scaled_matmul_fp4_reference(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            tensor_sf=tensor_sf,
+            sf_vector_size=sf_vector_size,
+            out_type=out_type,
+        )
 
     result = ops.custom(
         "mo.matmul.dynamic.block.scaled",
@@ -4014,6 +4262,168 @@ def dynamic_block_scaled_matmul_fp4(
     )[0].tensor
 
     return result
+
+
+def dynamic_block_scaled_matmul_mxfp4(
+    a: TensorValue,
+    b: TensorValue,
+    a_scales: TensorValue,
+    b_scales: TensorValue,
+    tensor_sf: TensorValue | float,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """Convenience wrapper for MXFP4 block-scaled matmul."""
+    return dynamic_block_scaled_matmul_fp4(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        tensor_sf=tensor_sf,
+        sf_vector_size=32,
+        out_type=out_type,
+    )
+
+
+def mxfp4_unpack(
+    packed: TensorValue,
+    scales: TensorValue,
+    sf_vector_size: int = 16,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """Unpacks packed FP4-E2M1 data with tcgen05 interleaved scales.
+
+    Args:
+        packed: Packed FP4 tensor of shape ``[M, K / 2]`` with dtype ``uint8``.
+        scales: Interleaved scales tensor of shape
+            ``[ceildiv(M, 128), ceildiv(K, sf_vector_size * 4), 32, 4, 4]``.
+            Dtype must be ``float8_e4m3fn`` (NVFP4) or ``float8_e8m0fnu`` (MXFP4).
+        sf_vector_size: Scale vector size. Must be ``16`` (NVFP4) or ``32`` (MXFP4).
+        out_type: Output dtype. Defaults to ``bfloat16``.
+
+    Returns:
+        Dequantized tensor of shape ``[M, K]``.
+    """
+    if packed.rank != 2:
+        raise ValueError(f"packed tensor must be rank 2 but got {packed.rank}")
+
+    if scales.rank != 5:
+        raise ValueError(f"scales tensor must be rank 5 but got {scales.rank}")
+
+    if packed.dtype != DType.uint8:
+        raise TypeError(
+            f"packed tensor dtype must be uint8, but got {packed.dtype}"
+        )
+
+    if scales.dtype not in (DType.float8_e4m3fn, DType.float8_e8m0fnu):
+        raise TypeError(
+            "scales dtype must be float8_e4m3fn or float8_e8m0fnu, "
+            f"but got {scales.dtype}"
+        )
+
+    if sf_vector_size not in (16, 32):
+        raise ValueError("sf_vector_size must be 16 (NVFP4) or 32 (MXFP4)")
+
+    expected_scales_type = (
+        DType.float8_e4m3fn if sf_vector_size == 16 else DType.float8_e8m0fnu
+    )
+    if scales.dtype != expected_scales_type:
+        raise ValueError(
+            "scales dtype/sf_vector_size mismatch: expected "
+            f"{expected_scales_type} for sf_vector_size={sf_vector_size}, got"
+            f" {scales.dtype}"
+        )
+
+    assert_same_device(packed=packed, scales=scales)
+
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    SF_K_GROUP_SIZE = SF_ATOM_K * sf_vector_size
+
+    unpacked_cols = packed.shape[1] * 2
+    expected_scales_dim_0 = ceildiv(packed.shape[0], Dim(SF_MN_GROUP_SIZE))
+    expected_scales_dim_1 = ceildiv(unpacked_cols, Dim(SF_K_GROUP_SIZE))
+    if (
+        scales.shape[0] != expected_scales_dim_0
+        or scales.shape[1] != expected_scales_dim_1
+        or scales.shape[2] != SF_ATOM_M[0]
+        or scales.shape[3] != SF_ATOM_M[1]
+        or scales.shape[4] != SF_ATOM_K
+    ):
+        raise ValueError(
+            "scales shape must be "
+            f"[{expected_scales_dim_0}, {expected_scales_dim_1}, "
+            f"{SF_ATOM_M[0]}, {SF_ATOM_M[1]}, {SF_ATOM_K}] "
+            f"but got {scales.shape}"
+        )
+
+    output = ops.custom(
+        "mo.mxfp4.unpack",
+        device=packed.device,
+        values=[packed, scales],
+        out_types=[
+            TensorType(
+                dtype=DType.bfloat16,
+                shape=[packed.shape[0], unpacked_cols],
+                device=packed.device,
+            )
+        ],
+        parameters={"SF_VECTOR_SIZE": sf_vector_size},
+    )[0].tensor
+
+    return output if out_type == DType.bfloat16 else ops.cast(output, out_type)
+
+
+def dynamic_block_scaled_matmul_fp4_reference(
+    a: TensorValue,
+    b: TensorValue,
+    a_scales: TensorValue,
+    b_scales: TensorValue,
+    tensor_sf: TensorValue | float,
+    sf_vector_size: int = 16,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """Reference block-scaled FP4 matmul using unpack + regular matmul.
+
+    This path is correctness-first and does not use tcgen05/SM100 kernels.
+    """
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            "The second dimension of b must match the second dimension of a"
+        )
+
+    if a.dtype != DType.uint8 or b.dtype != DType.uint8:
+        raise TypeError(
+            f"a and b dtypes must be uint8, but got {a.dtype} and {b.dtype}"
+        )
+
+    if a_scales.rank != 5 or b_scales.rank != 5:
+        raise ValueError("Both a_scales and b_scales must be rank 5 tensors")
+
+    assert_same_device(a=a, b=b, a_scales=a_scales, b_scales=b_scales)
+
+    a_dequantized = mxfp4_unpack(
+        a, a_scales, sf_vector_size=sf_vector_size, out_type=DType.bfloat16
+    )
+    b_dequantized = mxfp4_unpack(
+        b, b_scales, sf_vector_size=sf_vector_size, out_type=DType.bfloat16
+    )
+
+    result = ops.matmul(a_dequantized, ops.transpose(b_dequantized, 0, 1))
+
+    tensor_sf_value: TensorValue
+    if isinstance(tensor_sf, float):
+        tensor_sf_value = ops.constant(
+            tensor_sf, DType.float32, device=result.device
+        )
+    else:
+        tensor_sf_value = TensorValue(tensor_sf).to(result.device)
+
+    result = result * tensor_sf_value
+    return result if result.dtype == out_type else ops.cast(result, out_type)
 
 
 def quantize_dynamic_block_scaled_fp4(
@@ -4044,11 +4454,24 @@ def quantize_dynamic_block_scaled_fp4(
     if out_type not in (DType.uint8,):
         raise ValueError("out_type must be uint8 (fp4-e2m1fnX2)")
 
-    if scales_type not in (DType.float8_e4m3fn,):
-        raise ValueError("scales_type must be float8_e4m3fn for NVFP4")
+    if scales_type not in (DType.float8_e4m3fn, DType.float8_e8m0fnu):
+        raise ValueError(
+            "scales_type must be float8_e4m3fn (NVFP4) or"
+            " float8_e8m0fnu (MXFP4)"
+        )
 
-    if sf_vector_size != 16:
-        raise ValueError("sf_vector_size must be 16 for NVFP4")
+    if sf_vector_size not in (16, 32):
+        raise ValueError("sf_vector_size must be 16 (NVFP4) or 32 (MXFP4)")
+
+    expected_scales_type = (
+        DType.float8_e4m3fn if sf_vector_size == 16 else DType.float8_e8m0fnu
+    )
+    if scales_type != expected_scales_type:
+        raise ValueError(
+            "scales_type/sf_vector_size mismatch: expected "
+            f"{expected_scales_type} for sf_vector_size={sf_vector_size}, got"
+            f" {scales_type}"
+        )
 
     if int(input.shape[1]) % (sf_vector_size // 2) != 0:
         raise ValueError(
@@ -4125,11 +4548,24 @@ def block_scales_interleave(
     if scales.rank != 2:
         raise ValueError("Both a and b must be rank 2 tensors")
 
-    if scales.dtype != DType.float8_e4m3fn:
-        raise ValueError("scales dtype must be float8_e4m3fn")
+    if scales.dtype not in (DType.float8_e4m3fn, DType.float8_e8m0fnu):
+        raise ValueError(
+            "scales dtype must be float8_e4m3fn (NVFP4) or float8_e8m0fnu"
+            " (MXFP4)"
+        )
 
-    if sf_vector_size != 16:
-        raise ValueError("sf_vector_size must be 16 for NVFP4")
+    if sf_vector_size not in (16, 32):
+        raise ValueError("sf_vector_size must be 16 (NVFP4) or 32 (MXFP4)")
+
+    expected_scales_type = (
+        DType.float8_e4m3fn if sf_vector_size == 16 else DType.float8_e8m0fnu
+    )
+    if scales.dtype != expected_scales_type or scales_type != expected_scales_type:
+        raise ValueError(
+            "scales dtype/sf_vector_size mismatch: expected "
+            f"{expected_scales_type} for sf_vector_size={sf_vector_size}, got"
+            f" scales={scales.dtype}, scales_type={scales_type}"
+        )
 
     SF_ATOM_M = [32, 4]
     SF_ATOM_K = 4

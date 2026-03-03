@@ -21,10 +21,14 @@ from collections.abc import Iterable
 from max.dtype import DType
 from max.graph import DeviceRef, ShardingStrategy, TensorValue, Weight, ops
 from max.nn.attention import MHAMaskVariant, num_heads_for_device
+from max.nn.float8_config import Float8Config
 from max.nn.kernels import (
+    block_scales_interleave,
     flash_attention_ragged,
     fused_qk_ragged_rope,
     fused_qkv_ragged_matmul,
+    fused_qkv_ragged_matmul_scaled_float4,
+    quantize_dynamic_block_scaled_fp4,
 )
 from max.nn.kv_cache import (
     KVCacheParams,
@@ -62,6 +66,7 @@ class GptOssAttention(Module, Shardable):
         scale: float | None = None,
         has_bias: bool = False,
         local_window_size: int = 1024,
+        float8_config: Float8Config | None = None,
     ) -> None:
         """Initializes the attention layer.
 
@@ -93,6 +98,7 @@ class GptOssAttention(Module, Shardable):
         self.has_bias = has_bias
         self.devices = devices
         self._sharding_strategy: ShardingStrategy | None = None
+        self.float8_config = float8_config
         self.scale = (
             scale
             if scale is not None
@@ -118,6 +124,7 @@ class GptOssAttention(Module, Shardable):
             dtype=dtype,
             device=devices[0],
             has_bias=self.has_bias,
+            float8_config=float8_config,
         )
         self.k_proj = Linear(
             in_dim=hidden_size,
@@ -125,6 +132,7 @@ class GptOssAttention(Module, Shardable):
             dtype=dtype,
             device=devices[0],
             has_bias=self.has_bias,
+            float8_config=float8_config,
         )
         self.v_proj = Linear(
             in_dim=hidden_size,
@@ -132,6 +140,7 @@ class GptOssAttention(Module, Shardable):
             dtype=dtype,
             device=devices[0],
             has_bias=self.has_bias,
+            float8_config=float8_config,
         )
 
         self.o_proj = Linear(
@@ -140,6 +149,7 @@ class GptOssAttention(Module, Shardable):
             dtype=dtype,
             device=devices[0],
             has_bias=self.has_bias,
+            float8_config=float8_config,
         )
 
     @property
@@ -169,6 +179,65 @@ class GptOssAttention(Module, Shardable):
             [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], axis=0
         )
 
+    @property
+    def qkv_input_scale(self) -> TensorValue | None:
+        """Returns max q/k/v input scale for float4 path."""
+        if not self.float8_config or self.float8_config.is_dynamic:
+            return None
+
+        assert self.q_proj.input_scale is not None
+        assert self.k_proj.input_scale is not None
+        assert self.v_proj.input_scale is not None
+
+        return ops.max(
+            ops.concat(
+                (
+                    self.q_proj.input_scale.reshape((1,)),
+                    self.k_proj.input_scale.reshape((1,)),
+                    self.v_proj.input_scale.reshape((1,)),
+                )
+            )
+        ).reshape(())
+
+    @property
+    def qkv_weight_scale(self) -> TensorValue:
+        """Returns concatenated q/k/v block scales."""
+        assert self.float8_config is not None
+        assert self.q_proj.weight_scale is not None
+        assert self.k_proj.weight_scale is not None
+        assert self.v_proj.weight_scale is not None
+
+        q_scale: TensorValue = self.q_proj.weight_scale
+        k_scale: TensorValue = self.k_proj.weight_scale
+        v_scale: TensorValue = self.v_proj.weight_scale
+        if len(q_scale.shape) == 0:
+            q_scale = q_scale.reshape((1,))
+        if len(k_scale.shape) == 0:
+            k_scale = k_scale.reshape((1,))
+        if len(v_scale.shape) == 0:
+            v_scale = v_scale.reshape((1,))
+        return ops.concat((q_scale, k_scale, v_scale))
+
+    @property
+    def qkv_weight_scale_2(self) -> TensorValue | None:
+        """Returns max q/k/v tensor scale factor for float4 path."""
+        if not self.float8_config or self.float8_config.is_dynamic:
+            return None
+
+        assert self.q_proj.weight_scale_2 is not None
+        assert self.k_proj.weight_scale_2 is not None
+        assert self.v_proj.weight_scale_2 is not None
+
+        return ops.max(
+            ops.concat(
+                (
+                    self.q_proj.weight_scale_2.reshape((1,)),
+                    self.k_proj.weight_scale_2.reshape((1,)),
+                    self.v_proj.weight_scale_2.reshape((1,)),
+                )
+            )
+        ).reshape(())
+
     def __call__(
         self,
         x: TensorValue,
@@ -181,18 +250,67 @@ class GptOssAttention(Module, Shardable):
         layer_idx = ops.constant(
             self.layer_idx, DType.uint32, device=DeviceRef.CPU()
         )
-        # Call into fused qkv ragged matmul.
-        wqkv = self.wqkv
-        xq = fused_qkv_ragged_matmul(
-            self.kv_params,
-            input=x,
-            wqkv=wqkv,
-            bias=self.wqkv_bias,
-            input_row_offsets=kwargs["input_row_offsets"],
-            kv_collection=kv_collection,
-            layer_idx=layer_idx,
-            n_heads=self.n_heads,
+        wqkv = self.wqkv.to(x.device)
+        wqkv_bias = (
+            self.wqkv_bias.to(x.device) if self.wqkv_bias is not None else None
         )
+
+        if self.float8_config and (
+            self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4
+        ):
+            if wqkv_bias is not None:
+                raise NotImplementedError(
+                    "Float4 GPT-OSS attention path does not support QKV bias."
+                )
+            input_scale = self.qkv_input_scale
+            weight_scale = self.qkv_weight_scale
+            weight_scale_2 = self.qkv_weight_scale_2
+            assert input_scale is not None
+            assert weight_scale_2 is not None
+
+            is_nvfp4 = self.float8_config.is_nvfp4
+            scales_type = (
+                DType.float8_e4m3fn if is_nvfp4 else DType.float8_e8m0fnu
+            )
+            sf_vector_size = 16 if is_nvfp4 else 32
+            x_quant, x_scales = quantize_dynamic_block_scaled_fp4(
+                x,
+                tensor_sf=1.0 / input_scale,
+                scales_type=scales_type,
+                sf_vector_size=sf_vector_size,
+                out_type=DType.uint8,
+            )
+
+            weight_scale = block_scales_interleave(
+                weight_scale.to(x_quant.device),
+                scales_type=scales_type,
+                sf_vector_size=sf_vector_size,
+            )
+            xq = fused_qkv_ragged_matmul_scaled_float4(
+                self.kv_params,
+                input=x_quant,
+                wqkv=wqkv,
+                input_row_offsets=kwargs["input_row_offsets"],
+                kv_collection=kv_collection,
+                layer_idx=layer_idx,
+                n_heads=self.n_heads,
+                input_scale=x_scales.to(x_quant.device),
+                weight_scale=weight_scale,
+                tensor_sf=input_scale * weight_scale_2,
+                sf_vector_size=sf_vector_size,
+            )
+        else:
+            # Call into fused qkv ragged matmul.
+            xq = fused_qkv_ragged_matmul(
+                self.kv_params,
+                input=x,
+                wqkv=wqkv,
+                bias=wqkv_bias,
+                input_row_offsets=kwargs["input_row_offsets"],
+                kv_collection=kv_collection,
+                layer_idx=layer_idx,
+                n_heads=self.n_heads,
+            )
         # Apply rope.
         xq = xq.reshape((-1, self.n_heads, self.kv_params.head_dim))
 
@@ -323,6 +441,7 @@ class GptOssAttention(Module, Shardable):
                 scale=self.scale,
                 has_bias=self.has_bias,
                 local_window_size=self.local_window_size,
+                float8_config=self.float8_config,
             )
 
             # Assign sharded weights

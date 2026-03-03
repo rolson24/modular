@@ -64,6 +64,15 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
         )
         yarn_scaling_params: YarnScalingParams = config.rope_scaling
 
+        embedding_output_dtype = config.dtype
+        if embedding_output_dtype == DType.uint8:
+            embedding_output_dtype = DType.bfloat16
+        if (
+            config.float8_config is not None
+            and config.float8_config.embedding_output_dtype
+        ):
+            embedding_output_dtype = config.float8_config.embedding_output_dtype
+
         # RoPE with YARN scaling for full and window attention layers
         rope = YarnRotaryEmbedding(
             dim=config.hidden_size,
@@ -77,13 +86,18 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
-            dtype=config.dtype,
+            dtype=embedding_output_dtype,
             device=config.devices[0],
+        )
+
+        layer_quant_config = config.float8_config
+        norm_dtype = (
+            DType.bfloat16 if layer_quant_config is not None else config.dtype
         )
 
         self.norm = RMSNorm(
             config.hidden_size,
-            config.dtype,
+            norm_dtype,
             config.rms_norm_eps,
             multiply_before_cast=True,
         )
@@ -95,7 +109,7 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
-            dtype=config.dtype,
+            dtype=embedding_output_dtype,
             devices=config.devices,
             tied_weight=(
                 self.embed_tokens.weight if config.tie_word_embeddings else None
@@ -105,35 +119,54 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
         create_norm = functools.partial(
             RMSNorm,
             config.hidden_size,
-            config.dtype,
+            norm_dtype,
             eps=config.rms_norm_eps,
             multiply_before_cast=True,
         )
 
-        layers = [
-            GptOssTransformerBlock(
-                attention=GptOssAttention(
-                    rope=rope,
-                    num_attention_heads=config.num_attention_heads,
-                    num_key_value_heads=config.num_key_value_heads,
-                    hidden_size=config.hidden_size,
-                    kv_params=config.kv_params,
-                    layer_idx=i,
-                    dtype=config.dtype,
-                    devices=config.devices,
-                    local_window_size=config.sliding_window,
-                    has_bias=config.attention_bias,
-                    layer_type=config.layer_types[i]
-                    if i < len(config.layer_types)
-                    else "full_attention",
-                ),
-                mlp=GptOssMoE(config),
-                input_layernorm=create_norm(),
-                post_attention_layernorm=create_norm(),
-                devices=config.devices,
+        layers = []
+        for i in range(config.num_hidden_layers):
+            attn_quantized = (
+                layer_quant_config is None
+                or i in layer_quant_config.attn_qkv_in_float8
             )
-            for i in range(config.num_hidden_layers)
-        ]
+            mlp_quantized = (
+                layer_quant_config is None
+                or i in layer_quant_config.mlp_in_float8
+            )
+            attn_dtype = config.dtype if attn_quantized else DType.bfloat16
+            mlp_dtype = config.dtype if mlp_quantized else DType.bfloat16
+            attn_cfg = layer_quant_config if attn_quantized else None
+            mlp_cfg = layer_quant_config if mlp_quantized else None
+
+            layers.append(
+                GptOssTransformerBlock(
+                    attention=GptOssAttention(
+                        rope=rope,
+                        num_attention_heads=config.num_attention_heads,
+                        num_key_value_heads=config.num_key_value_heads,
+                        hidden_size=config.hidden_size,
+                        kv_params=config.kv_params,
+                        layer_idx=i,
+                        dtype=attn_dtype,
+                        devices=config.devices,
+                        local_window_size=config.sliding_window,
+                        has_bias=config.attention_bias,
+                        layer_type=config.layer_types[i]
+                        if i < len(config.layer_types)
+                        else "full_attention",
+                        float8_config=attn_cfg,
+                    ),
+                    mlp=GptOssMoE(
+                        config,
+                        dtype=mlp_dtype,
+                        float8_config=mlp_cfg,
+                    ),
+                    input_layernorm=create_norm(),
+                    post_attention_layernorm=create_norm(),
+                    devices=config.devices,
+                )
+            )
 
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads

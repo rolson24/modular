@@ -102,6 +102,8 @@ from linalg.fp4_utils import (
     SF_ATOM_M,
     SF_ATOM_K,
     SF_MN_GROUP_SIZE,
+    MXFP4_SF_VECTOR_SIZE,
+    MXFP4_SF_DTYPE,
     MXFP8_SF_VECTOR_SIZE,
     MXFP8_SF_DTYPE,
     NVFP4_SF_VECTOR_SIZE,
@@ -994,19 +996,32 @@ fn _cublasLt_matmul[
         msg="failed to set cublasLtMatmulDescAttribute for transb",
     )
 
-    comptime if ctx.default_device_info.compute == B200.compute:
+    comptime if ctx.default_device_info.compute >= B200.compute:
         if a_scales or b_scales:
             if not (a_scales and b_scales):
                 raise Error("a_scales and b_scales must be provided together")
             a_scale_tensor = a_scales.value()
             b_scale_tensor = b_scales.value()
 
-            comptime SF_VECTOR_SIZE = NVFP4_SF_VECTOR_SIZE if scales_type == NVFP4_SF_DTYPE else MXFP8_SF_VECTOR_SIZE
+            comptime SF_VECTOR_SIZE = (
+                NVFP4_SF_VECTOR_SIZE
+                if scales_type == NVFP4_SF_DTYPE
+                else (
+                    MXFP4_SF_VECTOR_SIZE
+                    if scales_type == MXFP4_SF_DTYPE
+                    else MXFP8_SF_VECTOR_SIZE
+                )
+            )
 
-            if scales_type not in (MXFP8_SF_DTYPE, NVFP4_SF_DTYPE):
+            if scales_type not in (
+                MXFP8_SF_DTYPE,
+                NVFP4_SF_DTYPE,
+                MXFP4_SF_DTYPE,
+            ):
                 raise Error(
-                    "Only float8_e8m0fnu(scaling type: MXFP8) and"
-                    " float8_e4m3fn(scaling type: MXFP4) are supported for B200"
+                    "Only float8_e8m0fnu(scaling type: MXFP8/MXFP4) and"
+                    " float8_e4m3fn(scaling type: NVFP4) are supported on"
+                    " SM100+"
                 )
             if not (
                 a_type == b_type
@@ -1015,19 +1030,31 @@ fn _cublasLt_matmul[
                         a_type == DType.float8_e4m3fn
                         and scales_type == MXFP8_SF_DTYPE
                     )
-                    or (a_type == DType.uint8 and scales_type == NVFP4_SF_DTYPE)
+                    or (
+                        a_type == DType.uint8
+                        and scales_type in (NVFP4_SF_DTYPE, MXFP4_SF_DTYPE)
+                    )
                 )
             ):
                 raise Error(
-                    "Only E4M3 input with MXFP8 scales or E2M1x2(i.e,"
-                    " UINT8) input with NVFP4 scales are supported for block"
-                    " scaled matmul"
+                    "Only E4M3 input with MXFP8 scales or E2M1x2(i.e, UINT8)"
+                    " input with NVFP4/MXFP4 scales are supported for block"
+                    " scaled matmul on SM100+"
+                )
+            if a_type == DType.uint8 and scales_type == MXFP4_SF_DTYPE:
+                raise Error(
+                    "MXFP4 block-scaled FP4 matmul is not routed through vendor"
+                    " BLAS in this stack. Use the Mojo SM100 structured kernel"
+                    " path instead."
                 )
 
             # TODO (KERN-2238): uint8 is a proxy data type for two Float4-E2M1 values for now.
             # We need to double the K dimension as we are allocating for uint8 input data type.
             # Remove this when GENAI-337 is fixed.
-            if a_type == DType.uint8 and scales_type == NVFP4_SF_DTYPE:
+            if a_type == DType.uint8 and scales_type in (
+                NVFP4_SF_DTYPE,
+                MXFP4_SF_DTYPE,
+            ):
                 K = K * 2
 
             if not (
@@ -1036,7 +1063,8 @@ fn _cublasLt_matmul[
             ):
                 raise Error(
                     "Due to TMA 16B alignment requirement, K must be divisible"
-                    " by 16/32 for MXFP8/NVFP4 input data type, respectively"
+                    " by 16/32 for MXFP8 and packed FP4 (NVFP4/MXFP4) input"
+                    " data type, respectively"
                 )
 
             if comptime (
@@ -1067,8 +1095,9 @@ fn _cublasLt_matmul[
             var b_scale_mode: cublasLtMatmulMatrixScale_t
 
             a_scale_mode = b_scale_mode = (
-                cublasLtMatmulMatrixScale_t.MATRIX_SCALE_VEC16_UE4M3 if scales_type
-                == NVFP4_SF_DTYPE else cublasLtMatmulMatrixScale_t.MATRIX_SCALE_VEC32_UE8M0
+                cublasLtMatmulMatrixScale_t.MATRIX_SCALE_VEC16_UE4M3
+                if scales_type == NVFP4_SF_DTYPE
+                else cublasLtMatmulMatrixScale_t.MATRIX_SCALE_VEC32_UE8M0
             )
 
             var a_scale_ptr = b_scale_tensor.ptr.bitcast[
@@ -1129,7 +1158,7 @@ fn _cublasLt_matmul[
             )
     else:
         if a_scales or b_scales:
-            raise Error("block scaling is only supported on B200 devices")
+            raise Error("block scaling is only supported on SM100+ devices")
 
     # create matrix descriptors, we are good with the details here so no need to set any extra attributes
     # table of supported type combinations can be found in the documentation: https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatmul

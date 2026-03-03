@@ -184,7 +184,7 @@ class Linear(Module, Shardable):
                 device=DeviceRef.CPU(),
                 quantization_encoding=quantization_encoding,
             )
-            if float8_config.is_nvfp4:
+            if float8_config.is_nvfp4 or float8_config.is_mxfp4:
                 self.weight_scale_2 = Weight(
                     name=f"{name}.weight_scale_2" if name else "weight_scale_2",
                     dtype=float8_config.input_scale.dtype,
@@ -426,7 +426,10 @@ class Linear(Module, Shardable):
                     )
                 if (
                     self.float8_config is not None
-                    and self.float8_config.is_nvfp4
+                    and (
+                        self.float8_config.is_nvfp4
+                        or self.float8_config.is_mxfp4
+                    )
                     and hasattr(self, "weight_scale_2")
                 ):
                     sharded.weight_scale_2 = self.weight_scale_2
@@ -462,7 +465,7 @@ class Linear(Module, Shardable):
             assert self.weight_scale is not None
             weight_scale: TensorValue = self.weight_scale
 
-            if self.float8_config.is_nvfp4:
+            if self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4:
                 assert self.input_scale is not None
                 assert self.weight_scale_2 is not None
                 res = matmul_float4(

@@ -25,6 +25,7 @@ from ..float8_config import Float8Config
 from ..kernels import (
     block_scales_interleave,
     grouped_dynamic_scaled_fp8_matmul,
+    grouped_dynamic_scaled_mxfp4_matmul,
     grouped_dynamic_scaled_nvfp4_matmul,
     quantize_dynamic_block_scaled_fp4,
     quantize_dynamic_scaled_float8,
@@ -221,8 +222,18 @@ class Nvfp4Strategy:
     ) -> tuple[TensorValue, TensorValue]:
         """Interleaves NVFP4 block scales for kernel layout."""
         return (
-            _interleave_nvfp4_scales(gate_up, device),
-            _interleave_nvfp4_scales(down, device),
+            _interleave_fp4_scales(
+                gate_up,
+                device,
+                sf_vector_size=16,
+                scales_type=DType.float8_e4m3fn,
+            ),
+            _interleave_fp4_scales(
+                down,
+                device,
+                sf_vector_size=16,
+                scales_type=DType.float8_e4m3fn,
+            ),
         )
 
     def fused_silu_quantize(
@@ -243,18 +254,113 @@ class Nvfp4Strategy:
         )
 
 
+class Mxfp4Strategy:
+    """MXFP4 quantization for MoE (correctness fallback path)."""
+
+    def __init__(self, config: Float8Config, dtype: DType):
+        self.config = config
+        self.dtype = dtype
+
+    def quantize(
+        self,
+        tensor: TensorValue,
+        group_size: int,
+        input_scale: TensorValue | None = None,
+    ) -> tuple[TensorValue, TensorValue]:
+        """Quantizes activations to MXFP4 and returns (quantized, scales)."""
+        del group_size
+        if input_scale is None:
+            raise ValueError("MXFP4 requires input_scale")
+        return quantize_dynamic_block_scaled_fp4(
+            tensor,
+            tensor_sf=1.0 / input_scale,
+            scales_type=DType.float8_e8m0fnu,
+            sf_vector_size=32,
+            out_type=DType.uint8,
+        )
+
+    def grouped_matmul(
+        self,
+        weight: TensorValue,
+        weight_scales: TensorValue,
+        expert_scales: TensorValue | None = None,
+        tokens_padded_per_expert: bool = False,
+        expert_inputs: tuple[TensorValue, ...] = (),
+    ) -> TensorValue:
+        """Runs grouped MXFP4 matmul with per-expert scales."""
+        del tokens_padded_per_expert
+        if expert_scales is None:
+            raise ValueError("MXFP4 requires expert_scales")
+        (
+            hidden,
+            hidden_scales,
+            expert_start,
+            scales_offsets,
+            expert_ids,
+            usage_stats,
+        ) = expert_inputs
+
+        return grouped_dynamic_scaled_mxfp4_matmul(
+            hidden,
+            weight,
+            hidden_scales,
+            weight_scales,
+            expert_start,
+            scales_offsets,
+            expert_ids,
+            expert_scales.to(hidden.device),
+            usage_stats,
+        )
+
+    def prepare_weight_scales(
+        self,
+        gate_up: TensorValue,
+        down: TensorValue,
+        device: DeviceRef,
+    ) -> tuple[TensorValue, TensorValue]:
+        """Interleaves MXFP4 block scales for fallback kernel layout."""
+        return (
+            _interleave_fp4_scales(
+                gate_up,
+                device,
+                sf_vector_size=32,
+                scales_type=DType.float8_e8m0fnu,
+            ),
+            _interleave_fp4_scales(
+                down,
+                device,
+                sf_vector_size=32,
+                scales_type=DType.float8_e8m0fnu,
+            ),
+        )
+
+    def fused_silu_quantize(
+        self,
+        gate_up_projs: TensorValue,
+        input_scales: TensorValue | None = None,
+        expert_inputs: tuple[TensorValue, ...] = (),
+    ) -> tuple[TensorValue, TensorValue]:
+        del gate_up_projs, input_scales, expert_inputs
+        raise NotImplementedError(
+            "MXFP4 expert-parallel fused SiLU+quantize is not implemented yet."
+        )
+
+
 def silu_gate(gate_up_projs: TensorValue, moe_dim: int) -> TensorValue:
     """Applies SiLU-gated activation: silu(gate) * up."""
     return ops.silu(gate_up_projs[:, :moe_dim]) * gate_up_projs[:, moe_dim:]
 
 
-def _interleave_nvfp4_scales(
-    scales: TensorValue, device: DeviceRef
+def _interleave_fp4_scales(
+    scales: TensorValue,
+    device: DeviceRef,
+    sf_vector_size: int,
+    scales_type: DType,
 ) -> TensorValue:
-    """Interleaves NVFP4 block scales for kernel consumption."""
+    """Interleaves FP4 block scales for kernel consumption."""
     if scales.rank != 3:
         raise ValueError(
-            f"expected NVFP4 scales of rank 3 but got {scales.rank}"
+            f"expected FP4 scales of rank 3 but got {scales.rank}"
         )
     num_experts = int(scales.shape[0])
     scales = scales.to(device)
@@ -263,7 +369,11 @@ def _interleave_nvfp4_scales(
     expert_scales = ops.split(scales, [1] * num_experts, axis=0)
     return ops.stack(
         [
-            block_scales_interleave(s.reshape([scale_m, scale_k]))
+            block_scales_interleave(
+                s.reshape([scale_m, scale_k]),
+                sf_vector_size=sf_vector_size,
+                scales_type=scales_type,
+            )
             for s in expert_scales
         ],
         axis=0,

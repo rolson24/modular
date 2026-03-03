@@ -789,3 +789,29 @@ def test_parse_float4_skips_gptq_quant_method(
     float8_config = parse_float8_config(hf_config, {}, DType.uint8)
 
     assert float8_config is None
+
+
+def test_parse_float4_from_hf_quant_method_mxfp4(
+    hf_config_instruct_fbgemm: AutoConfig,
+) -> None:
+    """Tests parsing modelopt FP4 config when quant_method is directly 'mxfp4'."""
+    hf_config = deepcopy(hf_config_instruct_fbgemm)
+    hf_config.quantization_config = {
+        "quant_method": "mxfp4",
+        "modules_to_not_convert": [
+            "model.layers.*.self_attn",
+            "model.layers.*.mlp.router",
+            "model.embed_tokens",
+            "lm_head",
+        ],
+    }
+
+    float8_config = parse_float8_config(hf_config, {}, DType.uint8)
+
+    assert float8_config is not None
+    assert float8_config.quant_method == "modelopt"
+    assert float8_config.quant_algo == "MXFP4"
+    assert float8_config.input_scale.block_size == (1, 32)
+    assert float8_config.weight_scale.block_size == (1, 16)
+    assert float8_config.attn_qkv_in_float8 == set()
+    assert float8_config.mlp_in_float8 == set(range(hf_config.num_hidden_layers))

@@ -241,12 +241,19 @@ class Float8Config:
         """Returns ``True`` if this config represents modelopt NVFP4."""
         return self.quant_method == "modelopt" and self.quant_algo == "NVFP4"
 
+    @property
+    def is_mxfp4(self) -> bool:
+        """Returns ``True`` if this config represents modelopt MXFP4."""
+        return self.quant_method == "modelopt" and self.quant_algo == "MXFP4"
+
     def quantized_scales_type(
         self, quantized_shape: Shape, device_ref: DeviceRef
     ) -> TensorType:
         """Returns the TensorType of the scales tensor after dynamic quantization."""
         if self.is_nvfp4:
             return _nvfp4_scales_type(quantized_shape, device_ref)
+        elif self.is_mxfp4:
+            return _mxfp4_scales_type(quantized_shape, device_ref)
         elif (
             self.input_scale.block_size is not None
             and self.input_scale.block_size == (1, 128)
@@ -257,10 +264,11 @@ class Float8Config:
 
 
 def nvfp4_packed_k(in_dim: int, float8_config: Float8Config | None) -> int:
-    """Returns packed K dimension for NVFP4 weights, else returns in_dim."""
+    """Returns packed K dimension for FP4 weights, else returns in_dim."""
     return (
         in_dim // 2
-        if float8_config is not None and float8_config.is_nvfp4
+        if float8_config is not None
+        and (float8_config.is_nvfp4 or float8_config.is_mxfp4)
         else in_dim
     )
 
@@ -301,6 +309,30 @@ def _nvfp4_scales_type(
     scales_dim_1 = ceildiv(quantized_shape[1], NVFP4_SF_VECTOR_SIZE * SF_ATOM_K)
     return TensorType(
         dtype=DType.float8_e4m3fn,
+        shape=(
+            scales_dim_0,
+            scales_dim_1,
+            SF_ATOM_M[0],
+            SF_ATOM_M[1],
+            SF_ATOM_K,
+        ),
+        device=device_ref,
+    )
+
+
+def _mxfp4_scales_type(
+    quantized_shape: Shape, device_ref: DeviceRef
+) -> TensorType:
+    """Returns the TensorType of the MXFP4 scales tensor."""
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    MXFP4_SF_VECTOR_SIZE = 32
+
+    scales_dim_0 = ceildiv(quantized_shape[0], SF_MN_GROUP_SIZE)
+    scales_dim_1 = ceildiv(quantized_shape[1], MXFP4_SF_VECTOR_SIZE * SF_ATOM_K)
+    return TensorType(
+        dtype=DType.float8_e8m0fnu,
         shape=(
             scales_dim_0,
             scales_dim_1,

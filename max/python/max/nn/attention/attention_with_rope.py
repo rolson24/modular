@@ -479,7 +479,9 @@ class AttentionWithRope(Module, Shardable):
                 wv = wv * self.v_proj.weight_scale.to(wv.device)
 
             wqkv = ops.concat((wq, wk, wv))
-            if self.float8_config and self.float8_config.is_nvfp4:
+            if self.float8_config and (
+                self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4
+            ):
                 return wqkv
             if self.float8_config and self.float8_config.is_static:
                 assert self.qkv_weight_scale is not None
@@ -608,23 +610,33 @@ class AttentionWithRope(Module, Shardable):
         wqkv_bias = (
             self.wqkv_bias.to(x.device) if self.wqkv_bias is not None else None
         )
-        if self.float8_config and self.float8_config.is_nvfp4:
+        if self.float8_config and (
+            self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4
+        ):
             input_scale = self.qkv_input_scale
             weight_scale = self.qkv_weight_scale
             weight_scale_2 = self.qkv_weight_scale_2
             assert input_scale is not None
             assert weight_scale_2 is not None
+            is_nvfp4 = self.float8_config.is_nvfp4
+            scales_type = (
+                DType.float8_e4m3fn if is_nvfp4 else DType.float8_e8m0fnu
+            )
+            sf_vector_size = 16 if is_nvfp4 else 32
 
             x, x_scales = quantize_dynamic_block_scaled_fp4(
                 x,
                 tensor_sf=1.0 / input_scale,
-                scales_type=DType.float8_e4m3fn,
+                scales_type=scales_type,
+                sf_vector_size=sf_vector_size,
                 out_type=DType.uint8,  # fp4-e2m1fnX2
             )
 
             weight_scale = weight_scale.to(x.device)
             weight_scale = block_scales_interleave(
                 weight_scale,
+                scales_type=scales_type,
+                sf_vector_size=sf_vector_size,
             )
 
             xq = fused_qkv_ragged_matmul_scaled_float4(
@@ -638,6 +650,7 @@ class AttentionWithRope(Module, Shardable):
                 input_scale=x_scales.to(x.device),
                 weight_scale=weight_scale,
                 tensor_sf=input_scale * weight_scale_2,
+                sf_vector_size=sf_vector_size,
             )
 
         elif self.float8_config:

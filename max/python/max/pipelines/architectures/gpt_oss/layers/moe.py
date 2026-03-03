@@ -20,6 +20,7 @@ from copy import copy
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
 from max.nn.clamp import clamp
+from max.nn.float8_config import Float8Config
 from max.nn.linear import Linear
 from max.nn.moe import GateUpFormat, MoEGate, StackedMoE
 from typing_extensions import Self
@@ -111,6 +112,8 @@ class GptOssMoE(StackedMoE):
         self,
         config: GptOssConfig,
         is_sharding: bool = False,
+        dtype: DType | None = None,
+        float8_config: Float8Config | None = None,
     ):
         """
         Args:
@@ -118,6 +121,12 @@ class GptOssMoE(StackedMoE):
             is_sharding: Set by shard() to skip weight init for sharded instances.
         """
         self.config = config
+        effective_dtype = config.dtype if dtype is None else dtype
+        effective_float8_config = (
+            config.float8_config
+            if float8_config is None and dtype is None
+            else float8_config
+        )
 
         super().__init__(
             devices=config.devices,
@@ -126,10 +135,11 @@ class GptOssMoE(StackedMoE):
             num_experts_per_token=config.num_experts_per_tok,
             moe_dim=config.intermediate_size,
             gate_cls=GptOssMoEGate,
-            dtype=config.dtype,
+            dtype=effective_dtype,
             gate_up_format=GateUpFormat.INTERLEAVED,
             activation_fn=gptoss_glu_activation,
             has_bias=True,
+            float8_config=effective_float8_config,
             is_sharding=is_sharding,
         )
 
@@ -147,4 +157,6 @@ class GptOssMoE(StackedMoE):
         return self.__class__(
             config=new_config,
             is_sharding=True,
+            dtype=self.dtype,
+            float8_config=self.float8_config,
         )

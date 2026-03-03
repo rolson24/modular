@@ -126,13 +126,20 @@ class GptOssModel(
     def estimate_activation_memory(
         cls, pipeline_config: PipelineConfig, huggingface_config: AutoConfig
     ) -> int:
-        del pipeline_config, huggingface_config  # Unused.
+        del huggingface_config  # Unused.
 
         # FIXME GEX-3248: This is a workaround for a MemoryManager fragmentation
         # issue. In #77700 we swapped the order of model weight loading and kv
         # cache loading. This affected memory fragmentation and led to CUDA OOM
         # when running `br smoke-test -- unsloth/gpt-oss-20b-bf16` on 1xH100.
         # We reduce the kv cache size slightly to avoid this.
+        #
+        # MXFP4 on single consumer Blackwell (e.g. RTX 5090) has materially
+        # lower static weight footprint than BF16. Using the BF16 reserve here
+        # can incorrectly reject valid configurations during preflight memory
+        # estimation before runtime has a chance to compile/load.
+        if pipeline_config.model.quantization_encoding == "float4_e2m1fnx2":
+            return 2 * 1024 * 1024 * 1024  # 2 GiB
         return 6 * 1024 * 1024 * 1024  # 6 GiB
 
     @staticmethod

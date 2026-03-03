@@ -23,8 +23,12 @@ from max.graph import BufferType, DeviceRef, Graph, TensorType, TensorValue
 from max.nn.kernels import (
     block_scales_interleave,
     dynamic_block_scaled_matmul_fp4,
+    grouped_dynamic_scaled_mxfp4_matmul,
+    dynamic_block_scaled_matmul_mxfp4,
+    dynamic_block_scaled_matmul_fp4_reference,
     fused_qkv_ragged_matmul_scaled_float4,
     grouped_dynamic_scaled_nvfp4_matmul,
+    mxfp4_unpack,
     quantize_dynamic_block_scaled_fp4,
 )
 from max.nn.kv_cache import (
@@ -204,6 +208,111 @@ def test_dynamic_block_scaled_1d1d_matmul_fp4() -> None:
         assert output.dtype == DType.bfloat16
 
 
+def test_dynamic_block_scaled_1d1d_matmul_mxfp4() -> None:
+    """Tests dynamic_block_scaled_1d1d_matmul_mxfp4 with valid inputs."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "dynamic_block_scaled_matmul_mxfp4",
+        input_types=[
+            TensorType(DType.uint8, shape=(127, 129), device=device),
+            TensorType(DType.uint8, shape=(129, 129), device=device),
+            TensorType(
+                DType.float8_e8m0fnu, shape=(1, 3, 32, 4, 4), device=device
+            ),
+            TensorType(
+                DType.float8_e8m0fnu, shape=(2, 3, 32, 4, 4), device=device
+            ),
+        ],
+    ) as graph:
+        a, b, a_scales, b_scales = (inp.tensor for inp in graph.inputs)
+
+        output = dynamic_block_scaled_matmul_mxfp4(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            1.0,
+        )
+        assert output.shape == [127, 129]
+        assert output.dtype == DType.bfloat16
+
+
+def test_mxfp4_unpack_valid() -> None:
+    """Tests mxfp4_unpack with valid input shape/dtype."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "mxfp4_unpack",
+        input_types=[
+            TensorType(DType.uint8, shape=(129, 68), device=device),
+            TensorType(
+                DType.float8_e8m0fnu, shape=(2, 2, 32, 4, 4), device=device
+            ),
+        ],
+    ) as graph:
+        packed, scales = (inp.tensor for inp in graph.inputs)
+        output = mxfp4_unpack(packed, scales, sf_vector_size=32)
+        assert output.shape == [129, 136]
+        assert output.dtype == DType.bfloat16
+
+
+def test_dynamic_block_scaled_matmul_fp4_reference() -> None:
+    """Tests reference FP4 matmul path with valid inputs."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "dynamic_block_scaled_matmul_fp4_reference",
+        input_types=[
+            TensorType(DType.uint8, shape=(127, 129), device=device),
+            TensorType(DType.uint8, shape=(129, 129), device=device),
+            TensorType(
+                DType.float8_e4m3fn, shape=(1, 5, 32, 4, 4), device=device
+            ),
+            TensorType(
+                DType.float8_e4m3fn, shape=(2, 5, 32, 4, 4), device=device
+            ),
+        ],
+    ) as graph:
+        a, b, a_scales, b_scales = (inp.tensor for inp in graph.inputs)
+        output = dynamic_block_scaled_matmul_fp4_reference(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            1.0,
+            sf_vector_size=16,
+        )
+        assert output.shape == [127, 129]
+        assert output.dtype == DType.bfloat16
+
+
+def test_dynamic_block_scaled_matmul_mxfp4_reference() -> None:
+    """Tests reference FP4 matmul path for MXFP4 scale layout."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "dynamic_block_scaled_matmul_mxfp4_reference",
+        input_types=[
+            TensorType(DType.uint8, shape=(127, 129), device=device),
+            TensorType(DType.uint8, shape=(129, 129), device=device),
+            TensorType(
+                DType.float8_e8m0fnu, shape=(1, 3, 32, 4, 4), device=device
+            ),
+            TensorType(
+                DType.float8_e8m0fnu, shape=(2, 3, 32, 4, 4), device=device
+            ),
+        ],
+    ) as graph:
+        a, b, a_scales, b_scales = (inp.tensor for inp in graph.inputs)
+        output = dynamic_block_scaled_matmul_fp4_reference(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            1.0,
+            sf_vector_size=32,
+        )
+        assert output.shape == [127, 129]
+        assert output.dtype == DType.bfloat16
+
+
 def test_quantize_dynamic_block_scaled_fp4() -> None:
     """Tests quantize_dynamic_block_scaled_fp4 with valid inputs."""
     device = DeviceRef.CPU()
@@ -226,6 +335,49 @@ def test_quantize_dynamic_block_scaled_fp4() -> None:
         assert scales.dtype == DType.float8_e4m3fn
 
 
+def test_quantize_dynamic_block_scaled_mxfp4() -> None:
+    """Tests quantize_dynamic_block_scaled_fp4 with MXFP4 scales."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "quantize_dynamic_block_scaled_mxfp4",
+        input_types=[
+            TensorType(DType.bfloat16, shape=(129, 160), device=device),
+        ],
+    ) as graph:
+        (input,) = (inp.tensor for inp in graph.inputs)
+
+        quantized_output, scales = quantize_dynamic_block_scaled_fp4(
+            input,
+            1.0,
+            sf_vector_size=32,
+            scales_type=DType.float8_e8m0fnu,
+        )
+        assert quantized_output.shape == [129, 80]
+        assert quantized_output.dtype == DType.uint8
+        assert scales.shape == [2, 2, 32, 4, 4]
+        assert scales.dtype == DType.float8_e8m0fnu
+
+
+def test_mxfp4_unpack_invalid_sf_vector_size() -> None:
+    """Tests mxfp4_unpack rejects unsupported sf_vector_size."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "mxfp4_unpack_invalid_sf_vector_size",
+        input_types=[
+            TensorType(DType.uint8, shape=(16, 8), device=device),
+            TensorType(
+                DType.float8_e4m3fn, shape=(1, 1, 32, 4, 4), device=device
+            ),
+        ],
+    ) as graph:
+        packed, scales = (inp.tensor for inp in graph.inputs)
+        with pytest.raises(
+            ValueError,
+            match="sf_vector_size must be 16 \\(NVFP4\\) or 32 \\(MXFP4\\)",
+        ):
+            mxfp4_unpack(packed, scales, sf_vector_size=8)
+
+
 def test_block_scales_interleave() -> None:
     """Tests block_scales_interleave with valid inputs."""
     device = DeviceRef.CPU()
@@ -243,6 +395,26 @@ def test_block_scales_interleave() -> None:
         )
         assert scales_interleaved.shape == [2, 34, 32, 4, 4]
         assert scales_interleaved.dtype == DType.float8_e4m3fn
+
+
+def test_block_scales_interleave_mxfp4() -> None:
+    """Tests block_scales_interleave with MXFP4 scales."""
+    device = DeviceRef.CPU()
+    with Graph(
+        "block_scales_interleave_mxfp4",
+        input_types=[
+            TensorType(DType.float8_e8m0fnu, shape=(129, 136), device=device),
+        ],
+    ) as graph:
+        (scales,) = (inp.tensor for inp in graph.inputs)
+
+        scales_interleaved = block_scales_interleave(
+            scales,
+            sf_vector_size=32,
+            scales_type=DType.float8_e8m0fnu,
+        )
+        assert scales_interleaved.shape == [2, 34, 32, 4, 4]
+        assert scales_interleaved.dtype == DType.float8_e8m0fnu
 
 
 # NVFP4 scale factor parameters (constants).
@@ -370,3 +542,119 @@ def test_grouped_dynamic_scaled_nvfp4_matmul_invalid(
     input_types = _get_nvfp4_input_types(DeviceRef.CPU(), **kwargs)
     with pytest.raises(error_type, match=error_match):
         _call_nvfp4_matmul(input_types)
+
+
+def _get_mxfp4_input_types(
+    device: DeviceRef,
+    num_experts: int = 3,
+    total_tokens: int = 99,
+    N: int = 256,
+    K: int = 512,
+    hidden_dtype: DType = DType.uint8,
+    a_scales_dtype: DType = DType.float8_e8m0fnu,
+    a_scales_shape: tuple[int, ...] | None = None,
+) -> list[TensorType | BufferType]:
+    """Returns input types for grouped_dynamic_scaled_mxfp4_matmul tests."""
+    sf_vector_size = 32
+    sf_k_group_size = _SF_ATOM_K * sf_vector_size
+    num_scale_rows = (total_tokens + _SF_MN_GROUP_SIZE - 1) // _SF_MN_GROUP_SIZE
+    K_groups = (K + sf_k_group_size - 1) // sf_k_group_size
+    N_groups = (N + _SF_MN_GROUP_SIZE - 1) // _SF_MN_GROUP_SIZE
+
+    if a_scales_shape is None:
+        a_scales_shape = (
+            num_scale_rows,
+            K_groups,
+            _SF_ATOM_M[0],
+            _SF_ATOM_M[1],
+            _SF_ATOM_K,
+        )
+
+    return [
+        TensorType(hidden_dtype, shape=(total_tokens, K // 2), device=device),
+        TensorType(DType.uint8, shape=(num_experts, N, K // 2), device=device),
+        TensorType(a_scales_dtype, shape=a_scales_shape, device=device),
+        TensorType(
+            DType.float8_e8m0fnu,
+            shape=(
+                num_experts,
+                N_groups,
+                K_groups,
+                _SF_ATOM_M[0],
+                _SF_ATOM_M[1],
+                _SF_ATOM_K,
+            ),
+            device=device,
+        ),
+        TensorType(
+            DType.uint32, shape=(1,), device=device
+        ),  # expert_start_indices
+        TensorType(
+            DType.uint32, shape=(num_experts,), device=device
+        ),  # a_scale_offsets
+        TensorType(
+            DType.int32, shape=(num_experts,), device=device
+        ),  # expert_ids
+        TensorType(
+            DType.float32, shape=(num_experts,), device=device
+        ),  # expert_scales
+        TensorType(
+            DType.uint32, shape=(2,), device=device
+        ),  # expert_usage_stats_host
+    ]
+
+
+def _call_mxfp4_matmul(
+    input_types: list[TensorType | BufferType],
+) -> TensorValue:
+    """Builds a graph calling grouped_dynamic_scaled_mxfp4_matmul."""
+    with Graph("test_mxfp4", input_types=input_types) as graph:
+        inputs = graph.inputs
+        return grouped_dynamic_scaled_mxfp4_matmul(
+            inputs[0].tensor,
+            inputs[1].tensor,
+            inputs[2].tensor,
+            inputs[3].tensor,
+            inputs[4].tensor,
+            inputs[5].tensor,
+            inputs[6].tensor,
+            inputs[7].tensor,
+            inputs[8].tensor,
+        )
+
+
+def test_grouped_dynamic_scaled_mxfp4_matmul_valid() -> None:
+    """Tests grouped_dynamic_scaled_mxfp4_matmul with valid inputs."""
+    input_types = _get_mxfp4_input_types(DeviceRef.CPU())
+    output = _call_mxfp4_matmul(input_types)
+    assert output.shape == [99, 256]
+    assert output.dtype == DType.bfloat16
+
+
+@pytest.mark.parametrize(
+    "kwargs,error_type,error_match",
+    [
+        (
+            {"hidden_dtype": DType.bfloat16},
+            TypeError,
+            "hidden_states and weight dtypes must be uint8 for MXFP4",
+        ),
+        (
+            {"a_scales_dtype": DType.float8_e4m3fn},
+            TypeError,
+            "a_scales and b_scales dtypes must be float8_e8m0fnu for MXFP4",
+        ),
+        (
+            {"a_scales_shape": (1, 8)},
+            ValueError,
+            "expected a_scales of rank 5 and b_scales of rank 6",
+        ),
+    ],
+)
+def test_grouped_dynamic_scaled_mxfp4_matmul_invalid(
+    kwargs: dict[str, Any], error_type: type[Exception], error_match: str
+) -> None:
+    """Tests grouped_dynamic_scaled_mxfp4_matmul rejects invalid inputs."""
+    input_types = _get_mxfp4_input_types(DeviceRef.CPU(), **kwargs)
+    with pytest.raises(error_type, match=error_match):
+        _call_mxfp4_matmul(input_types)

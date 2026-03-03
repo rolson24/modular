@@ -40,6 +40,7 @@ from linalg.fp4_utils import (
     SF_ATOM_M,
     SF_ATOM_K,
     NVFP4_SF_VECTOR_SIZE,
+    MXFP4_SF_VECTOR_SIZE,
     MXFP8_SF_VECTOR_SIZE,
 )
 from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
@@ -614,8 +615,10 @@ struct BlockScaledMatmulConfig[
         # Scaling factors configuration (SFA, SFB)
         self.scaling_kind = scaling_kind
         self.vec_sf_size = (
-            NVFP4_SF_VECTOR_SIZE if self.scaling_kind
-            == UMMAKind.KIND_MXF4NVF4 else MXFP8_SF_VECTOR_SIZE
+            NVFP4_SF_VECTOR_SIZE if Self.sfa_dtype == DType.float8_e4m3fn else (
+                MXFP4_SF_VECTOR_SIZE if self.scaling_kind
+                == UMMAKind.KIND_MXF4NVF4 else MXFP8_SF_VECTOR_SIZE
+            )
         )
         var sf_k_group_size = self.vec_sf_size * SF_ATOM_K
         self.num_sf_k_tiles = (

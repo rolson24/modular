@@ -218,7 +218,7 @@ fn get_scale_factor[
     //,
     SF_VECTOR_SIZE: Int,
 ](
-    scales_tensor: LayoutTensor[scales_dtype, scales_layout, MutAnyOrigin],
+    scales_tensor: LayoutTensor[mut=False, scales_dtype, scales_layout, _],
     row_idx: Int,
     col_idx: Int,
 ) -> Scalar[scales_dtype]:
@@ -269,7 +269,7 @@ fn get_batched_scale_factor[
     //,
     SF_VECTOR_SIZE: Int,
 ](
-    scales_tensor: LayoutTensor[scales_dtype, scales_layout, MutAnyOrigin],
+    scales_tensor: LayoutTensor[mut=False, scales_dtype, scales_layout, _],
     batch_idx: Int,
     row_idx: Int,
     col_idx: Int,

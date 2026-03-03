@@ -29,11 +29,15 @@ from max.graph import DeviceRef, ShardingStrategy, TensorValue, Weight, ops
 from max.support.math import ceildiv
 from typing_extensions import Self
 
-from ..float8_config import Float8Config
+from ..float8_config import Float8Config, nvfp4_packed_k
 from ..kernels import (
+    block_scales_interleave,
+    grouped_dynamic_scaled_mxfp4_matmul,
+    grouped_dynamic_scaled_nvfp4_matmul,
     grouped_dynamic_scaled_fp8_matmul,
     grouped_matmul_ragged,
     moe_create_indices,
+    quantize_dynamic_block_scaled_fp4,
     quantize_dynamic_scaled_float8,
 )
 from ..layer import Module, Shardable
@@ -151,6 +155,9 @@ def _gate_up_scale_sharding_strategy(
     Returns:
         The concatenated gate and up scale shards for this device.
     """
+    if num_devices == 1:
+        return weight
+
     weight_start, weight_end = _compute_shard_range(moe_dim, i, num_devices)
 
     scale_gate_start = weight_start // block_size
@@ -199,6 +206,9 @@ def _down_proj_scale_sharding_strategy(
     Returns:
         The down projection scale shard for this device.
     """
+    if num_devices == 1:
+        return weight
+
     weight_start, weight_end = _compute_shard_range(moe_dim, i, num_devices)
 
     scale_start = weight_start // block_size
@@ -365,33 +375,59 @@ class StackedMoE(Module, Shardable):
         if not is_sharding:
             self._init_weights()
 
+    @property
+    def _is_fp4(self) -> bool:
+        return self.float8_config is not None and (
+            self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4
+        )
+
     def _init_weights(self) -> None:
         """Initializes stacked weight tensors for all experts."""
+        packed_hidden_dim = nvfp4_packed_k(self.hidden_dim, self.float8_config)
+        packed_moe_dim = nvfp4_packed_k(self.moe_dim, self.float8_config)
+        if self._is_fp4:
+            gate_up_shape = [
+                self.num_experts,
+                2 * self.moe_dim,
+                packed_hidden_dim,
+            ]
+            down_shape = [
+                self.num_experts,
+                self.hidden_dim,
+                packed_moe_dim,
+            ]
+        else:
+            gate_up_shape = [self.num_experts, packed_hidden_dim, 2 * self.moe_dim]
+            down_shape = [self.num_experts, packed_moe_dim, self.hidden_dim]
+
         self._gate_up_weight = Weight(
             name="experts.gate_up_proj",
-            shape=[self.num_experts, self.hidden_dim, 2 * self.moe_dim],
+            shape=gate_up_shape,
             dtype=self.dtype,
             device=self.devices[0],
         )
 
         self._down_weight = Weight(
             name="experts.down_proj",
-            shape=[self.num_experts, self.moe_dim, self.hidden_dim],
+            shape=down_shape,
             dtype=self.dtype,
             device=self.devices[0],
         )
 
         if self.has_bias:
+            bias_dtype = self.dtype
+            if self.float8_config and self.float8_config.bias_dtype:
+                bias_dtype = self.float8_config.bias_dtype
             self._gate_up_bias = Weight(
                 name="experts.gate_up_proj_bias",
                 shape=[self.num_experts, 2 * self.moe_dim],
-                dtype=self.dtype,
+                dtype=bias_dtype,
                 device=self.devices[0],
             )
             self._down_bias = Weight(
                 name="experts.down_proj_bias",
                 shape=[self.num_experts, self.hidden_dim],
-                dtype=self.dtype,
+                dtype=bias_dtype,
                 device=self.devices[0],
             )
 
@@ -399,16 +435,28 @@ class StackedMoE(Module, Shardable):
             block_size = self.float8_config.weight_scale.block_size
             assert block_size is not None, "FP8 MoE requires block scaling"
 
-            gate_up_scale_shape = [
-                self.num_experts,
-                ceildiv(self.hidden_dim, block_size[0]),
-                ceildiv(2 * self.moe_dim, block_size[1]),
-            ]
-            down_scale_shape = [
-                self.num_experts,
-                ceildiv(self.moe_dim, block_size[0]),
-                ceildiv(self.hidden_dim, block_size[1]),
-            ]
+            if self._is_fp4:
+                gate_up_scale_shape = [
+                    self.num_experts,
+                    2 * self.moe_dim,
+                    ceildiv(packed_hidden_dim, block_size[1]),
+                ]
+                down_scale_shape = [
+                    self.num_experts,
+                    self.hidden_dim,
+                    ceildiv(packed_moe_dim, block_size[1]),
+                ]
+            else:
+                gate_up_scale_shape = [
+                    self.num_experts,
+                    ceildiv(self.hidden_dim, block_size[0]),
+                    ceildiv(2 * self.moe_dim, block_size[1]),
+                ]
+                down_scale_shape = [
+                    self.num_experts,
+                    ceildiv(self.moe_dim, block_size[0]),
+                    ceildiv(self.hidden_dim, block_size[1]),
+                ]
 
             self._gate_up_scale = Weight(
                 name="experts.gate_up_proj_scale",
@@ -426,21 +474,29 @@ class StackedMoE(Module, Shardable):
     @property
     def gate_up_proj_transposed(self) -> TensorValue:
         """The gate/up weights transposed to ``[num_experts, out_features, in_features]`` layout."""
+        if self._is_fp4:
+            return self._gate_up_weight
         return self._gate_up_weight.transpose(1, 2)
 
     @property
     def down_proj_transposed(self) -> TensorValue:
         """The down weights transposed to ``[num_experts, out_features, in_features]`` layout."""
+        if self._is_fp4:
+            return self._down_weight
         return self._down_weight.transpose(1, 2)
 
     @property
     def gate_up_scale_transposed(self) -> TensorValue:
         """The gate/up scales transposed for FP8 matmul."""
+        if self._is_fp4:
+            return self._gate_up_scale
         return self._gate_up_scale.transpose(1, 2)
 
     @property
     def down_scale_transposed(self) -> TensorValue:
         """The down scales transposed for FP8 matmul."""
+        if self._is_fp4:
+            return self._down_scale
         return self._down_scale.transpose(1, 2)
 
     def _split_gate_up(
@@ -653,7 +709,7 @@ class StackedMoE(Module, Shardable):
         permuted_states: TensorValue,
         routing: RoutingInfo,
     ) -> TensorValue:
-        """Runs the FP8 forward pass with dynamic quantization.
+        """Runs the quantized forward pass (FP8 or FP4).
 
         Args:
             permuted_states: The input states reordered by expert assignment.
@@ -665,6 +721,9 @@ class StackedMoE(Module, Shardable):
         Raises:
             ValueError: If ``permuted_states`` is not BF16.
         """
+        if self._is_fp4:
+            return self._forward_fp4(permuted_states, routing)
+
         assert self.float8_config is not None
         assert self.float8_config.input_scale.block_size is not None
         input_block_size = self.float8_config.input_scale.block_size[1]
@@ -729,6 +788,152 @@ class StackedMoE(Module, Shardable):
 
         return down_output
 
+    def _interleave_fp4_scales(
+        self,
+        scales: TensorValue,
+        sf_vector_size: int,
+        scales_type: DType,
+    ) -> TensorValue:
+        if scales.rank != 3:
+            raise ValueError(
+                f"expected FP4 scales of rank 3 but got {scales.rank}"
+            )
+        num_experts = int(scales.shape[0])
+        scale_m = scales.shape[1]
+        scale_k = scales.shape[2]
+        expert_scales = ops.split(scales, [1] * num_experts, axis=0)
+        return ops.stack(
+            [
+                block_scales_interleave(
+                    s.reshape([scale_m, scale_k]),
+                    sf_vector_size=sf_vector_size,
+                    scales_type=scales_type,
+                )
+                for s in expert_scales
+            ],
+            axis=0,
+        )
+
+    def _grouped_fp4_matmul(
+        self,
+        hidden_fp4: TensorValue,
+        hidden_scales: TensorValue,
+        weight_fp4: TensorValue,
+        weight_scales: TensorValue,
+        routing: RoutingInfo,
+        expert_scales: TensorValue,
+        a_scale_offsets: TensorValue,
+    ) -> TensorValue:
+        assert self.float8_config is not None
+        usage_stats = routing.expert_usage_stats.to(DeviceRef.CPU())
+        if self.float8_config.is_nvfp4:
+            return grouped_dynamic_scaled_nvfp4_matmul(
+                hidden_fp4,
+                weight_fp4,
+                hidden_scales,
+                weight_scales,
+                routing.expert_start_indices,
+                a_scale_offsets,
+                routing.expert_ids,
+                expert_scales,
+                usage_stats,
+            )
+        return grouped_dynamic_scaled_mxfp4_matmul(
+            hidden_fp4,
+            weight_fp4,
+            hidden_scales,
+            weight_scales,
+            routing.expert_start_indices,
+            a_scale_offsets,
+            routing.expert_ids,
+            expert_scales,
+            usage_stats,
+        )
+
+    def _forward_fp4(
+        self,
+        permuted_states: TensorValue,
+        routing: RoutingInfo,
+    ) -> TensorValue:
+        """Runs FP4 forward pass for stacked MoE (NVFP4/MXFP4)."""
+        assert self.float8_config is not None
+
+        if permuted_states.dtype != DType.bfloat16:
+            raise ValueError("Input must be BF16 for dynamic FP4 quantization")
+
+        sf_vector_size = 16 if self.float8_config.is_nvfp4 else 32
+        scales_type = (
+            DType.float8_e4m3fn
+            if self.float8_config.is_nvfp4
+            else DType.float8_e8m0fnu
+        )
+        expert_scales = ops.constant(
+            1.0, dtype=DType.float32, device=permuted_states.device
+        ).broadcast_to([self.num_experts])
+        a_scale_offsets = ops.constant(
+            0, dtype=DType.uint32, device=permuted_states.device
+        ).broadcast_to([routing.expert_ids.shape[0]])
+
+        gate_up_scales = self._interleave_fp4_scales(
+            self.gate_up_scale_transposed.to(permuted_states.device),
+            sf_vector_size=sf_vector_size,
+            scales_type=scales_type,
+        )
+        down_scales = self._interleave_fp4_scales(
+            self.down_scale_transposed.to(permuted_states.device),
+            sf_vector_size=sf_vector_size,
+            scales_type=scales_type,
+        )
+
+        input_fp4, input_scales = quantize_dynamic_block_scaled_fp4(
+            permuted_states,
+            tensor_sf=1.0,
+            scales_type=scales_type,
+            sf_vector_size=sf_vector_size,
+            out_type=DType.uint8,
+        )
+        gate_up_output = self._grouped_fp4_matmul(
+            input_fp4,
+            input_scales,
+            self.gate_up_proj_transposed,
+            gate_up_scales,
+            routing,
+            expert_scales,
+            a_scale_offsets,
+        )
+
+        gated_output = self._apply_gated_activation(gate_up_output, routing)
+
+        gated_fp4, gated_scales = quantize_dynamic_block_scaled_fp4(
+            gated_output,
+            tensor_sf=1.0,
+            scales_type=scales_type,
+            sf_vector_size=sf_vector_size,
+            out_type=DType.uint8,
+        )
+        down_output = self._grouped_fp4_matmul(
+            gated_fp4,
+            gated_scales,
+            self.down_proj_transposed,
+            down_scales,
+            routing,
+            expert_scales,
+            a_scale_offsets,
+        )
+
+        if self.has_bias:
+            expert_assignments = ops.gather(
+                routing.router_idx_flat, routing.token_expert_order, axis=0
+            )
+            down_bias: TensorValue = self._down_bias
+            if self.tp_size > 1:
+                down_bias = down_bias / self.tp_size
+            down_output = self._apply_bias(
+                down_output, down_bias, expert_assignments
+            )
+
+        return down_output
+
     @property
     def sharding_strategy(self) -> ShardingStrategy | None:
         """The sharding strategy for this module."""
@@ -747,6 +952,10 @@ class StackedMoE(Module, Shardable):
         if not strategy.is_tensor_parallel:
             raise ValueError(
                 "Only tensor parallel sharding strategy is supported for StackedMoE"
+            )
+        if self._is_fp4 and strategy.num_devices > 1:
+            raise NotImplementedError(
+                "FP4 tensor-parallel sharding for StackedMoE is not implemented."
             )
 
         self._sharding_strategy = strategy

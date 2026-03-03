@@ -12,6 +12,17 @@ package(default_visibility = [
 ])
 
 modular_py_test(
+    name = "weight-adapter",
+    srcs = ["test_weight_adapter.py"],
+    deps = [
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines",
+        requirement("numpy"),
+    ],
+)
+
+modular_py_test(
     name = "yarn-rotary-embeddings",
     srcs = glob(["**/test_yarn_rotary_embeddings.py"]) + ["conftest.py"],
     data = [

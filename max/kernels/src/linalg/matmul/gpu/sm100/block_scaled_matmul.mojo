@@ -1163,11 +1163,11 @@ fn blackwell_block_scaled_tma_umma_warp_specialized_kernel[
         config.num_sf_k_tiles == 1
         and config.scaling_kind == UMMAKind.KIND_MXF8F6F4
     ) or (
-        config.num_sf_k_tiles == 4
+        config.num_sf_k_tiles in (2, 4)
         and config.scaling_kind == UMMAKind.KIND_MXF4NVF4
     ), (
         "Only support num_sf_k_tiles == 1 and scaling kind is"
-        " UMMAKind.KIND_MXF8F6F4 or num_sf_k_tiles == 2 and scaling kind is"
+        " UMMAKind.KIND_MXF8F6F4 or num_sf_k_tiles in (2, 4) and scaling kind is"
         " UMMAKind.KIND_MXF4NVF4"
     )
 

@@ -527,7 +527,13 @@ def _resolve_quant_config(
         return standalone_config
 
     if any("weight_scale_2" in name for name in state_dict):
-        return {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        quant_algo = "NVFP4"
+        for weight_name, weight in state_dict.items():
+            if "weight_scale" in weight_name and "weight_scale_2" not in weight_name:
+                if weight.dtype == DType.float8_e8m0fnu:
+                    quant_algo = "MXFP4"
+                    break
+        return {"quant_method": "modelopt", "quant_algo": quant_algo}
 
     return None
 
@@ -546,34 +552,88 @@ def _parse_modelopt_float4_config(
     if hf_quant_config:
         quant_method = hf_quant_config.get("quant_method", quant_method)
         quant_algo = hf_quant_config.get("quant_algo", quant_algo)
+
+    if isinstance(quant_algo, str):
+        quant_algo = quant_algo.upper()
+
+    if isinstance(quant_method, str):
+        quant_method_lower = quant_method.lower()
+        # Some checkpoints (e.g. GPT-OSS MXFP4) encode algo in quant_method.
+        if quant_algo is None and quant_method_lower in ("mxfp4", "nvfp4"):
+            quant_algo = quant_method_upper = quant_method_lower.upper()
+            # Normalize to modelopt-style metadata expected by Float8Config.
+            quant_method = "modelopt"
+            quant_algo = quant_method_upper
+
+    if isinstance(quant_method, str):
+        quant_method = quant_method.lower()
     if not quant_method or not quant_algo:
+        return None
+
+    if quant_algo == "NVFP4":
+        input_block_k = 16
+        weight_scale_dtype = DType.float8_e4m3fn
+    elif quant_algo == "MXFP4":
+        input_block_k = 32
+        weight_scale_dtype = DType.float8_e8m0fnu
+    else:
+        logger.debug("Unsupported modelopt float4 quant algo: %s", quant_algo)
         return None
 
     input_spec = Float8InputScaleSpec(
         granularity=Float8ScaleGranularity.BLOCK,
         origin=Float8ScaleOrigin.STATIC,
         dtype=DType.float32,
-        block_size=(1, 16),
+        block_size=(1, input_block_k),
     )
     weight_spec = Float8WeightScaleSpec(
         granularity=Float8ScaleGranularity.BLOCK,
-        dtype=DType.float8_e4m3fn,
-        block_size=(1, 16 // 2),
+        dtype=weight_scale_dtype,
+        block_size=(1, input_block_k // 2),
     )
 
     bias_dtype = _bias_dtype(state_dict)
 
-    # All layers use float4 in modelopt NVFP4 checkpoints.
-    all_layers = set(range(huggingface_config.num_hidden_layers))
+    # By default, all layers use float4 in modelopt FP4 checkpoints.
+    num_hidden_layers = (
+        huggingface_config.text_config.num_hidden_layers
+        if hasattr(huggingface_config, "text_config")
+        else huggingface_config.num_hidden_layers
+    )
+    all_layers = set(range(num_hidden_layers))
+    mlp_in_float8 = set(all_layers)
+    attn_qkv_in_float8 = set(all_layers)
+
+    if hf_quant_config:
+        ignored_modules = set(hf_quant_config.get("modules_to_not_convert", []))
+        if ignored_modules:
+            has_wildcards = any("*" in module for module in ignored_modules)
+            if has_wildcards:
+                if any("self_attn" in module for module in ignored_modules):
+                    attn_qkv_in_float8 = set()
+                # Keep router-only exclusions quantized for MLP experts.
+                if any(
+                    "mlp" in module and "router" not in module
+                    for module in ignored_modules
+                ):
+                    mlp_in_float8 = set()
+            else:
+                (
+                    mlp_in_float8,
+                    attn_qkv_in_float8,
+                    _,
+                ) = _quantized_layers_and_embedding_dtype(
+                    huggingface_config, ignored_modules, state_dict
+                )
 
     return Float8Config(
         input_scale=input_spec,
         weight_scale=weight_spec,
-        mlp_in_float8=all_layers,
-        attn_qkv_in_float8=all_layers,
+        mlp_in_float8=mlp_in_float8,
+        attn_qkv_in_float8=attn_qkv_in_float8,
         embedding_output_dtype=DType.bfloat16,
         bias_dtype=bias_dtype,
-        quant_method=quant_method,
+        quant_method="modelopt",
         quant_algo=quant_algo,
     )
 
@@ -594,7 +654,10 @@ def _parse_float4_config(
         return None
 
     quant_method = quant_config.get("quant_method")
-    if quant_method == "modelopt":
+    if isinstance(quant_method, str):
+        quant_method = quant_method.lower()
+
+    if quant_method in ("modelopt", "mxfp4", "nvfp4"):
         return _parse_modelopt_float4_config(
             huggingface_config,
             state_dict,

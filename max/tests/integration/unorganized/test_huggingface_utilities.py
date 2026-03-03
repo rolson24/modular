@@ -49,6 +49,24 @@ def test_huggingface_repo__file_exists(
     ]
 
 
+def test_huggingface_repo__weight_files_prefers_non_original_shards() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        (repo / "model-00000-of-00002.safetensors").touch()
+        (repo / "model-00001-of-00002.safetensors").touch()
+        (repo / "original").mkdir()
+        (repo / "original" / "model.safetensors").touch()
+
+        hf_repo = HuggingFaceRepo(repo_id=temp_dir)
+        files = hf_repo.weight_files[WeightsFormat.safetensors]
+
+        assert Path("original/model.safetensors") not in map(Path, files)
+        assert sorted(map(Path, files)) == [
+            Path("model-00000-of-00002.safetensors"),
+            Path("model-00001-of-00002.safetensors"),
+        ]
+
+
 def test_huggingface_repo__formats_available(
     llama_3_1_8b_instruct_local_path: str,
     tiny_llama_1_1b_chat_v1_0_local_path: str,

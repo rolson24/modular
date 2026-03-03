@@ -418,10 +418,24 @@ class HuggingFaceRepo:
                 ]
             else:
                 # If there is more than one weight, ignore consolidated tensors.
+                filtered_safetensor_paths = [
+                    f for f in safetensor_paths if "consolidated" not in f
+                ]
+
+                # Some repos (for example openai/gpt-oss-20b) contain both
+                # MAX-compatible safetensor shards and an `original/` export.
+                # Prefer the non-`original/` files when both are present.
+                non_original_paths = [
+                    f
+                    for f in filtered_safetensor_paths
+                    if "/original/" not in f.replace("\\", "/")
+                ]
+                if non_original_paths:
+                    filtered_safetensor_paths = non_original_paths
+
                 weight_files[WeightsFormat.safetensors] = [
                     f.replace(f"{self.repo_id}/", "")
-                    for f in safetensor_paths
-                    if "consolidated" not in f
+                    for f in filtered_safetensor_paths
                 ]
 
         if gguf_paths:

@@ -26,8 +26,10 @@ from linalg.fp4_utils import (
     SF_ATOM_K,
     SF_MN_GROUP_SIZE,
     NVFP4_SF_VECTOR_SIZE,
+    MXFP4_SF_VECTOR_SIZE,
     MXFP8_SF_VECTOR_SIZE,
     NVFP4_SF_DTYPE,
+    MXFP4_SF_DTYPE,
     MXFP8_SF_DTYPE,
     set_scale_factor,
     get_scale_factor,
@@ -106,8 +108,8 @@ fn heuristic_and_outliers_dispatch[
     ].value() * 2 if a_type == DType.uint8 else a_layout.shape[1].value()
 
     comptime assert (
-        ctx.default_device_info.compute == B200.compute
-    ), "This kernel is only supported on SM100"
+        ctx.default_device_info.compute >= B200.compute
+    ), "This kernel is only supported on SM100+"
 
     comptime assert transpose_b, "Only support transposed B"
 
@@ -116,12 +118,17 @@ fn heuristic_and_outliers_dispatch[
         and scales_dtype == NVFP4_SF_DTYPE
         and SF_VECTOR_SIZE == NVFP4_SF_VECTOR_SIZE
     ) or (
+        (a_type == b_type == DType.uint8)
+        and scales_dtype == MXFP4_SF_DTYPE
+        and SF_VECTOR_SIZE == MXFP4_SF_VECTOR_SIZE
+    ) or (
         (a_type == b_type == DType.float8_e4m3fn)
         and scales_dtype == MXFP8_SF_DTYPE
         and SF_VECTOR_SIZE == MXFP8_SF_VECTOR_SIZE
     ), (
-        "Only support NVFP4_SF_DTYPE (float8_e4m3fn) or MXFP8_SF_DTYPE"
-        " (float8_e8m0fnu) for scales for now."
+        "Only support NVFP4(float8_e4m3fn, sf=16),"
+        " MXFP4(float8_e8m0fnu, sf=32), or"
+        " MXFP8(float8_e8m0fnu, sf=32) for scales."
     )
 
     comptime assert (

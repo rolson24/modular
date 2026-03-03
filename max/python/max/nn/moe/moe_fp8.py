@@ -23,6 +23,7 @@ from ..kernels import moe_create_indices
 from .moe import MoE
 from .quant_strategy import (
     Fp8Strategy,
+    Mxfp4Strategy,
     Nvfp4Scales,
     Nvfp4Strategy,
     QuantStrategy,
@@ -48,6 +49,8 @@ class MoEQuantized(MoE):
         assert self.float8_config is not None
         if self.float8_config.is_nvfp4:
             return Nvfp4Strategy(self.float8_config, self.dtype)
+        if self.float8_config.is_mxfp4:
+            return Mxfp4Strategy(self.float8_config, self.dtype)
         return Fp8Strategy(self.float8_config, self.dtype)
 
     @property
@@ -67,7 +70,7 @@ class MoEQuantized(MoE):
         return values
 
     def _nvfp4_scales(self) -> Nvfp4Scales:
-        """Collects NVFP4 input and expert scales for matmuls."""
+        """Collects FP4 input and expert scales for grouped matmuls."""
         gate_up_input = self._collect_input_scale("gate_proj", collect_all=True)
         down_input = self._collect_input_scale("down_proj")
 
@@ -174,9 +177,11 @@ class MoEQuantized(MoE):
         return ops.stack(scales, axis=0).to(self.devices[0])
 
     @property
-    def _is_nvfp4(self) -> bool:
-        """Whether the current float8 config uses NVFP4."""
-        return self.float8_config is not None and self.float8_config.is_nvfp4
+    def _is_fp4(self) -> bool:
+        """Whether the current float8 config uses FP4 (NVFP4/MXFP4)."""
+        return self.float8_config is not None and (
+            self.float8_config.is_nvfp4 or self.float8_config.is_mxfp4
+        )
 
     def _ep_call(
         self,
@@ -185,12 +190,19 @@ class MoEQuantized(MoE):
         router_weight: TensorValue,
     ) -> TensorValue:
         """Executes the expert-parallel quantized MoE path."""
+        if self.float8_config is not None and self.float8_config.is_mxfp4:
+            raise NotImplementedError(
+                "MXFP4 expert-parallel MoE path is not implemented yet."
+            )
         strategy = self._strategy()
-        nvfp4 = self._nvfp4_scales() if self._is_nvfp4 else None
+        fp4_scales = self._nvfp4_scales() if self._is_fp4 else None
 
         device_id = self.devices[0].id
         expert_inputs = self.ep_batch_manager.ep_dispatch(
-            x, router_idx, device_id, nvfp4.gate_up_input if nvfp4 else None
+            x,
+            router_idx,
+            device_id,
+            fp4_scales.gate_up_input if fp4_scales else None,
         )
 
         gate_up_scales, down_scales = strategy.prepare_weight_scales(
@@ -200,14 +212,14 @@ class MoEQuantized(MoE):
         gate_up = strategy.grouped_matmul(
             self.gate_up_proj,
             gate_up_scales,
-            expert_scales=nvfp4.gate_up_expert if nvfp4 else None,
+            expert_scales=fp4_scales.gate_up_expert if fp4_scales else None,
             tokens_padded_per_expert=True,
             expert_inputs=expert_inputs,
         )
 
         down_in, silu_scales = strategy.fused_silu_quantize(
             gate_up,
-            input_scales=nvfp4.down_input if nvfp4 else None,
+            input_scales=fp4_scales.down_input if fp4_scales else None,
             expert_inputs=expert_inputs,
         )
 
@@ -215,7 +227,7 @@ class MoEQuantized(MoE):
         down = strategy.grouped_matmul(
             self.down_proj,
             down_scales,
-            expert_scales=nvfp4.down_expert if nvfp4 else None,
+            expert_scales=fp4_scales.down_expert if fp4_scales else None,
             tokens_padded_per_expert=True,
             expert_inputs=down_inputs,
         )
@@ -230,7 +242,7 @@ class MoEQuantized(MoE):
     def __call__(self, x: TensorValue) -> TensorValue:
         """Runs quantized MoE routing and expert computation."""
         strategy = self._strategy()
-        nvfp4 = self._nvfp4_scales() if self._is_nvfp4 else None
+        fp4_scales = self._nvfp4_scales() if self._is_fp4 else None
 
         assert not self.apply_router_weight_first, (
             "apply_router_weight_first must be False for quantized MoE"
@@ -264,7 +276,7 @@ class MoEQuantized(MoE):
         permuted_quant, permuted_scales = strategy.quantize(
             permuted,
             self._token_group_size,
-            nvfp4.gate_up_input if nvfp4 else None,
+            fp4_scales.gate_up_input if fp4_scales else None,
         )
 
         gate_up_scales, down_scales = strategy.prepare_weight_scales(
@@ -279,7 +291,7 @@ class MoEQuantized(MoE):
             usage_stats.to(DeviceRef.CPU()),
         )
 
-        if nvfp4:
+        if fp4_scales:
             a_scale_offsets = ops.constant(
                 0, dtype=DType.uint32, device=x.device
             ).broadcast_to([expert_ids.shape[0]])
@@ -292,7 +304,7 @@ class MoEQuantized(MoE):
         gate_up = strategy.grouped_matmul(
             self.gate_up_proj,
             gate_up_scales,
-            expert_scales=nvfp4.gate_up_expert if nvfp4 else None,
+            expert_scales=fp4_scales.gate_up_expert if fp4_scales else None,
             expert_inputs=expert_inputs,
         )
 
@@ -300,7 +312,7 @@ class MoEQuantized(MoE):
         gate_up_quant, gate_up_scales = strategy.quantize(
             gate_up,
             self._token_group_size,
-            nvfp4.down_input if nvfp4 else None,
+            fp4_scales.down_input if fp4_scales else None,
         )
 
         down_inputs = (gate_up_quant, gate_up_scales) + expert_inputs[2:]
@@ -308,7 +320,7 @@ class MoEQuantized(MoE):
         down = strategy.grouped_matmul(
             self.down_proj,
             down_scales,
-            expert_scales=nvfp4.down_expert if nvfp4 else None,
+            expert_scales=fp4_scales.down_expert if fp4_scales else None,
             expert_inputs=down_inputs,
         )
 
