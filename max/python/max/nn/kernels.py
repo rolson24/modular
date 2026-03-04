@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from itertools import count
 from collections.abc import MutableSequence
 from typing import Any, cast
 
@@ -64,6 +65,7 @@ _MHA_MASK_VARIANT_TO_ATTENTION_MASK = {
 
 KEY_CACHE_INDEX = 0
 VALUE_CACHE_INDEX = 1
+_MXFP4_GROUP_DIM_COUNTER = count()
 
 
 def _mask_str(mask_variant: MHAMaskVariant) -> str:
@@ -3229,7 +3231,7 @@ def grouped_dynamic_scaled_nvfp4_matmul(
 
     weight_k = weight.shape[2]
     hidden_k = hidden_states.shape[1]
-    if weight_k != hidden_k or weight.shape[0] != expert_ids.shape[0]:
+    if weight_k != hidden_k:
         raise ValueError(
             "expected weight is of shape [num_experts, *, "
             f"{hidden_k}] but got {weight.shape}"
@@ -3395,6 +3397,11 @@ def _dequantize_grouped_fp4_weights(
     return ops.stack(dequantized_weights, axis=0)
 
 
+def _next_mxfp4_group_dim(prefix: str) -> str:
+    """Returns a unique symbolic dim name for MXFP4 grouped fallback slicing."""
+    return f"{prefix}_{next(_MXFP4_GROUP_DIM_COUNTER)}"
+
+
 def grouped_dynamic_scaled_mxfp4_matmul(
     hidden_states: TensorValue,
     weight: TensorValue,
@@ -3406,14 +3413,14 @@ def grouped_dynamic_scaled_mxfp4_matmul(
     expert_scales: TensorValue,
     expert_usage_stats_host: TensorValue,
     out_type: DType = DType.bfloat16,
+    b_scales_preordered_by_expert_ids: bool = False,
 ) -> TensorValue:
     """Correctness-first grouped MXFP4 matmul fallback for MoE.
 
-    This fallback dequantizes packed FP4 activations/weights and runs the
-    existing grouped BF16 matmul kernel. It is intended for non-tcgen05 GPUs.
+    This fallback avoids full-weight BF16 dequantization by running one
+    block-scaled FP4 matmul per expert group and concatenating the group
+    outputs in routing order. It is intended for non-tcgen05 GPUs.
     """
-    del a_scale_offsets  # Unused in fallback path; scales are contiguous.
-
     if weight.rank != 3:
         raise ValueError(f"expected weight of rank 3 but got {weight.rank}")
     if hidden_states.rank != 2:
@@ -3423,7 +3430,7 @@ def grouped_dynamic_scaled_mxfp4_matmul(
 
     weight_k = weight.shape[2]
     hidden_k = hidden_states.shape[1]
-    if weight_k != hidden_k or weight.shape[0] != expert_ids.shape[0]:
+    if weight_k != hidden_k:
         raise ValueError(
             "expected weight is of shape [num_experts, *, "
             f"{hidden_k}] but got {weight.shape}"
@@ -3517,29 +3524,252 @@ def grouped_dynamic_scaled_mxfp4_matmul(
         hidden_states=hidden_states,
         weight=weight,
         a_scales=a_scales,
-        b_scales=b_scales,
         expert_start_indices=expert_start_indices,
         expert_ids=expert_ids,
-        expert_scales=expert_scales,
+        a_scale_offsets=a_scale_offsets,
     )
 
-    hidden_dequant = mxfp4_unpack(
-        hidden_states,
-        a_scales,
-        sf_vector_size=SF_VECTOR_SIZE,
-        out_type=DType.bfloat16,
+    if not isinstance(expert_ids.shape[0], StaticDim):
+        raise ValueError(
+            "expert_ids.shape[0] must be statically known for MXFP4 fallback"
+        )
+    num_groups = int(expert_ids.shape[0])
+    use_per_group_fp4_path = (
+        isinstance(expert_start_indices.shape[0], StaticDim)
+        and int(expert_start_indices.shape[0]) == num_groups + 1
     )
-    weight_dequant = _dequantize_grouped_fp4_weights(
-        weight, b_scales, expert_scales, sf_vector_size=SF_VECTOR_SIZE
+
+    if not use_per_group_fp4_path:
+        # Compatibility fallback for callers that don't provide
+        # [num_groups + 1] offsets. This path is heavier on memory.
+        weight = ops.gather(weight, expert_ids, axis=0)
+        if not b_scales_preordered_by_expert_ids:
+            b_scales = ops.gather(b_scales, expert_ids, axis=0)
+        if not b_scales_preordered_by_expert_ids:
+            expert_scales = ops.gather(expert_scales, expert_ids, axis=0)
+        local_expert_ids = ops.range(
+            0,
+            num_groups,
+            dtype=DType.int32,
+            device=expert_ids.device,
+        )
+        hidden_dequant = mxfp4_unpack(
+            hidden_states,
+            a_scales,
+            sf_vector_size=SF_VECTOR_SIZE,
+            out_type=DType.bfloat16,
+        )
+        weight_dequant = _dequantize_grouped_fp4_weights(
+            weight, b_scales, expert_scales, sf_vector_size=SF_VECTOR_SIZE
+        )
+        output = grouped_matmul_ragged(
+            hidden_dequant,
+            weight_dequant,
+            expert_start_indices,
+            local_expert_ids,
+            expert_usage_stats_host.to(DeviceRef.CPU()),
+        )
+        return output if output.dtype == out_type else ops.cast(output, out_type)
+
+    # Preferred path for MXFP4 on non-tcgen05 systems: keep grouped execution
+    # inside one custom op so compile-time graph expansion does not scale with
+    # the number of active groups.
+    if (
+        not b_scales_preordered_by_expert_ids
+        and os.getenv("MAX_MXFP4_USE_GROUPED_CUSTOM_OP", "0") == "1"
+        and os.getenv("MAX_MXFP4_DISABLE_GROUPED_CUSTOM_OP", "0") != "1"
+    ):
+        expert_start_indices_device = expert_start_indices
+        expert_ids_device = expert_ids
+        a_scale_offsets_device = a_scale_offsets
+        expert_scales_device = expert_scales
+        max_tokens_per_expert = (
+            ops.cast(expert_usage_stats_host[0], DType.uint32)
+            .to(DeviceRef.CPU())
+            .reshape(())
+        )
+        num_active_experts = (
+            ops.cast(expert_usage_stats_host[1], DType.uint32)
+            .to(DeviceRef.CPU())
+            .reshape(())
+        )
+        output = ops.custom(
+            "mo.grouped.matmul.dynamic.scaled.mxfp4",
+            device=hidden_states.device,
+            values=[
+                hidden_states,
+                weight,
+                a_scales,
+                b_scales,
+                expert_start_indices_device,
+                expert_ids_device,
+                a_scale_offsets_device,
+                expert_scales_device,
+                max_tokens_per_expert,
+                num_active_experts,
+            ],
+            out_types=[
+                TensorType(
+                    dtype=out_type,
+                    shape=[hidden_states.shape[0], weight.shape[1]],
+                    device=hidden_states.device,
+                ),
+            ],
+        )[0].tensor
+        return output if output.dtype == out_type else ops.cast(output, out_type)
+
+    # Avoid full BF16 expert dequantization (which can explode memory on SM120):
+    # run one block-scaled FP4 matmul per expert group in-graph and concatenate
+    # slices in routing order.
+    use_aligned_slice_fastpath = (
+        os.getenv("MAX_MXFP4_USE_ALIGNED_GROUP_FASTPATH", "0") == "1"
     )
-    output = grouped_matmul_ragged(
-        hidden_dequant,
-        weight_dequant,
-        expert_start_indices,
-        expert_ids,
-        expert_usage_stats_host.to(DeviceRef.CPU()),
+    group_outputs: list[TensorValue] = []
+    total_tokens = ops.cast(
+        TensorValue(hidden_states.shape[0]), DType.int64
+    ).to(DeviceRef.CPU())
+    zero_i64 = ops.constant(0, dtype=DType.int64, device=DeviceRef.CPU())
+    sf_mn_group_i64 = ops.constant(
+        SF_MN_GROUP_SIZE, dtype=DType.int64, device=DeviceRef.CPU()
     )
-    return output if output.dtype == out_type else ops.cast(output, out_type)
+    sf_mn_group_minus1_i64 = ops.constant(
+        SF_MN_GROUP_SIZE - 1, dtype=DType.int64, device=DeviceRef.CPU()
+    )
+    num_active_experts = ops.cast(
+        expert_usage_stats_host[1], DType.int64
+    ).to(DeviceRef.CPU())
+    for i in range(num_groups):
+        token_start = ops.cast(expert_start_indices[i], DType.int64).to(
+            DeviceRef.CPU()
+        )
+        token_stop = ops.cast(expert_start_indices[i + 1], DType.int64).to(
+            DeviceRef.CPU()
+        )
+        group_is_active = ops.constant(
+            i, dtype=DType.int64, device=DeviceRef.CPU()
+        ) < num_active_experts
+        token_start = ops.where(group_is_active, token_start, total_tokens)
+        token_stop = ops.where(group_is_active, token_stop, total_tokens)
+        # `moe_create_indices` returns fixed-size expert arrays; inactive tail
+        # entries may be irrelevant. Clamp and order offsets defensively so
+        # slicing is always valid.
+        token_start = ops.min(ops.max(token_start, zero_i64), total_tokens)
+        token_stop = ops.min(ops.max(token_stop, zero_i64), total_tokens)
+        token_stop = ops.max(token_stop, token_start)
+        expert_id_i = expert_ids[i]
+        expert_idx_i = ops.unsqueeze(expert_id_i, axis=0)
+
+        group_weight = ops.gather(weight, expert_idx_i, axis=0).reshape(
+            [weight.shape[1], weight.shape[2]]
+        )
+
+        if b_scales_preordered_by_expert_ids:
+            group_b_scales = b_scales[i]
+        else:
+            group_b_scales = ops.gather(b_scales, expert_idx_i, axis=0).reshape(
+                [
+                    b_scales.shape[1],
+                    b_scales.shape[2],
+                    b_scales.shape[3],
+                    b_scales.shape[4],
+                    b_scales.shape[5],
+                ]
+            )
+
+        if b_scales_preordered_by_expert_ids:
+            group_expert_scale = expert_scales[i].reshape(())
+        else:
+            group_expert_scale = ops.gather(
+                expert_scales, expert_idx_i, axis=0
+            ).reshape(())
+        if group_expert_scale.dtype != DType.float32:
+            group_expert_scale = ops.cast(group_expert_scale, DType.float32)
+        group_expert_scale = group_expert_scale.to(DeviceRef.CPU())
+
+        if use_aligned_slice_fastpath:
+            has_tokens = token_stop > token_start
+
+            # Preserve correctness for scale indexing by aligning the sliced
+            # token window to the start of its 128-token MXFP4 scale group.
+            # This avoids full-sequence matmuls while keeping local scale
+            # coords valid without tcgen05 grouped kernels.
+            scale_start = ops.cast(
+                token_start // sf_mn_group_i64, DType.int64
+            ).to(DeviceRef.CPU())
+            scale_stop = ops.cast(
+                (token_stop + sf_mn_group_minus1_i64) // sf_mn_group_i64,
+                DType.int64,
+            ).to(DeviceRef.CPU())
+            aligned_token_start = ops.where(
+                has_tokens, scale_start * sf_mn_group_i64, token_start
+            )
+            scale_stop = ops.where(has_tokens, scale_stop, scale_start)
+
+            aligned_tokens_dim = _next_mxfp4_group_dim("mxfp4_aligned_tokens")
+            group_hidden_states = ops.slice_tensor(
+                hidden_states,
+                [
+                    (slice(aligned_token_start, token_stop), aligned_tokens_dim),
+                    slice(None),
+                ],
+            )
+            aligned_scale_groups_dim = _next_mxfp4_group_dim(
+                "mxfp4_aligned_scale_groups"
+            )
+            group_a_scales = ops.slice_tensor(
+                a_scales,
+                [
+                    (slice(scale_start, scale_stop), aligned_scale_groups_dim),
+                    slice(None),
+                    slice(None),
+                    slice(None),
+                    slice(None),
+                ],
+            )
+            group_output = dynamic_block_scaled_matmul_fp4(
+                group_hidden_states,
+                group_weight,
+                group_a_scales,
+                group_b_scales,
+                tensor_sf=group_expert_scale,
+                sf_vector_size=SF_VECTOR_SIZE,
+                out_type=out_type,
+            )
+            local_start = token_start - aligned_token_start
+            local_stop = token_stop - aligned_token_start
+        else:
+            group_output = dynamic_block_scaled_matmul_fp4(
+                hidden_states,
+                group_weight,
+                a_scales,
+                group_b_scales,
+                tensor_sf=group_expert_scale,
+                sf_vector_size=SF_VECTOR_SIZE,
+                out_type=out_type,
+            )
+            local_start = token_start
+            local_stop = token_stop
+        group_tokens_dim = _next_mxfp4_group_dim("mxfp4_group_tokens")
+        group_output = ops.slice_tensor(
+            group_output,
+            [
+                (slice(local_start, local_stop), group_tokens_dim),
+                slice(None),
+            ],
+        )
+        if group_output.dtype != out_type:
+            group_output = ops.cast(group_output, out_type)
+        group_outputs.append(group_output)
+
+    if not group_outputs:
+        return ops.constant(
+            0.0, dtype=out_type, device=hidden_states.device
+        ).broadcast_to([0, weight.shape[1]])
+    if len(group_outputs) == 1:
+        output = group_outputs[0]
+    else:
+        output = ops.concat(group_outputs, axis=0)
+    return output.rebind([hidden_states.shape[0], weight.shape[1]])
 
 
 def grouped_dynamic_scaled_fp8_matmul(

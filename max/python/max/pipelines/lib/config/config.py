@@ -897,8 +897,21 @@ class PipelineConfig(ConfigFileModel):
 
         # by this point, the quantization_encoding must be provided. verify it is supported.
         if model_config.quantization_encoding not in arch.supported_encodings:
+            hint = ""
+            if (
+                self.runtime.prefer_module_v3
+                and arch.name.endswith("_ModuleV3")
+            ):
+                fallback_arch = arch.name.removesuffix("_ModuleV3")
+                hint = (
+                    f" Try rerunning without '--prefer-module-v3' to use"
+                    f" '{fallback_arch}' if available."
+                )
+
             raise ValueError(
-                f"quantization_encoding of '{model_config.quantization_encoding}' not supported by MAX engine."
+                f"quantization_encoding '{model_config.quantization_encoding}' is not "
+                f"supported by architecture '{arch.name}'. Supported encodings: "
+                f"{sorted(arch.supported_encodings)}.{hint}"
             )
         model_config.validate_and_resolve_with_resolved_quantization_encoding(
             supported_encodings=arch.supported_encodings,

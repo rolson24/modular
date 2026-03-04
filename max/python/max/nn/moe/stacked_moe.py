@@ -823,6 +823,7 @@ class StackedMoE(Module, Shardable):
         routing: RoutingInfo,
         expert_scales: TensorValue,
         a_scale_offsets: TensorValue,
+        mxfp4_scales_preordered: bool = False,
     ) -> TensorValue:
         assert self.float8_config is not None
         usage_stats = routing.expert_usage_stats.to(DeviceRef.CPU())
@@ -848,6 +849,7 @@ class StackedMoE(Module, Shardable):
             routing.expert_ids,
             expert_scales,
             usage_stats,
+            b_scales_preordered_by_expert_ids=mxfp4_scales_preordered,
         )
 
     def _forward_fp4(
@@ -874,13 +876,16 @@ class StackedMoE(Module, Shardable):
             0, dtype=DType.uint32, device=permuted_states.device
         ).broadcast_to([routing.expert_ids.shape[0]])
 
+        gate_up_scale_source = self.gate_up_scale_transposed
+        down_scale_source = self.down_scale_transposed
+
         gate_up_scales = self._interleave_fp4_scales(
-            self.gate_up_scale_transposed.to(permuted_states.device),
+            gate_up_scale_source,
             sf_vector_size=sf_vector_size,
             scales_type=scales_type,
         )
         down_scales = self._interleave_fp4_scales(
-            self.down_scale_transposed.to(permuted_states.device),
+            down_scale_source,
             sf_vector_size=sf_vector_size,
             scales_type=scales_type,
         )
@@ -900,6 +905,7 @@ class StackedMoE(Module, Shardable):
             routing,
             expert_scales,
             a_scale_offsets,
+            mxfp4_scales_preordered=False,
         )
 
         gated_output = self._apply_gated_activation(gate_up_output, routing)
@@ -919,6 +925,7 @@ class StackedMoE(Module, Shardable):
             routing,
             expert_scales,
             a_scale_offsets,
+            mxfp4_scales_preordered=False,
         )
 
         if self.has_bias:

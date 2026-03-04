@@ -34,7 +34,6 @@ gpt_oss_modulev3_arch = SupportedArchitecture(
     default_encoding="bfloat16",
     supported_encodings={
         "bfloat16",
-        "float4_e2m1fnx2",
     },
     pipeline_model=GptOssModel,
     task=PipelineTask.TEXT_GENERATION,

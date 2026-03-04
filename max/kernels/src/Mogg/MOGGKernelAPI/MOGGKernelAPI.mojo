@@ -95,6 +95,7 @@ from linalg.fp8_quantization import (
 )
 from linalg.fp4_quantization import (
     block_scaled_matmul,
+    grouped_matmul_dynamic_scaled_mxfp4,
     quantize_dynamic_block_scaled,
     block_scales_interleave,
 )
@@ -8169,6 +8170,56 @@ struct Struct_grouped_matmul_dynamic_scaled_nvfp4:
             a_scale_offsets.to_tile_tensor[DType.int64](),
             expert_ids.to_tile_tensor[DType.int64](),
             expert_scales.to_tile_tensor[DType.int64](),
+            Int(num_active_experts),
+            cuda_ctx,
+        )
+
+
+@compiler.register("mo.grouped.matmul.dynamic.scaled.mxfp4")
+struct Struct_grouped_matmul_dynamic_scaled_mxfp4:
+    """MOGG wrapper for grouped MXFP4 matrix multiplication."""
+
+    @always_inline
+    @staticmethod
+    fn execute[
+        c_type: DType,
+        a_type: DType,
+        b_type: DType,
+        scales_type: DType,
+        //,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2],
+        a: InputTensor[dtype=a_type, rank=2],
+        b: InputTensor[dtype=b_type, rank=3],
+        a_scales: InputTensor[dtype=scales_type, rank=5],
+        b_scales: InputTensor[dtype=scales_type, rank=6],
+        expert_start_indices: InputTensor[dtype = DType.uint32, rank=1],
+        expert_ids: InputTensor[dtype = DType.int32, rank=1],
+        a_scale_offsets: InputTensor[dtype = DType.uint32, rank=1],
+        expert_scales: InputTensor[dtype = DType.float32, rank=1],
+        max_num_tokens_per_expert: UInt32,
+        num_active_experts: UInt32,
+        context: DeviceContextPtr,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "grouped dynamic scaled MXFP4 matmul only supports GPUs"
+        if num_active_experts == 0:
+            return
+
+        var cuda_ctx = context.get_device_context()
+        grouped_matmul_dynamic_scaled_mxfp4[target=target](
+            managed_tensor_slice_to_ndbuffer(c),
+            managed_tensor_slice_to_ndbuffer(a),
+            managed_tensor_slice_to_ndbuffer(b),
+            managed_tensor_slice_to_ndbuffer(a_scales),
+            managed_tensor_slice_to_ndbuffer(b_scales),
+            managed_tensor_slice_to_ndbuffer(expert_start_indices),
+            managed_tensor_slice_to_ndbuffer(expert_ids),
+            managed_tensor_slice_to_ndbuffer(a_scale_offsets),
+            managed_tensor_slice_to_ndbuffer(expert_scales),
+            Int(max_num_tokens_per_expert),
             Int(num_active_experts),
             cuda_ctx,
         )

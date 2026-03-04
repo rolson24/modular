@@ -41,6 +41,7 @@ from .fp4_utils import (
     MXFP8_SF_DTYPE,
     set_scale_factor,
     get_scale_factor,
+    get_batched_scale_factor,
 )
 from std.gpu.host.info import B200
 from std.sys.info import CompilationTarget
@@ -52,7 +53,7 @@ from linalg.utils import (
 )
 from std.utils.index import Index, IndexList
 from linalg.matmul.vendor.blas import matmul
-from buffer import Dim, NDBuffer
+from buffer import Dim, DimList, NDBuffer
 from layout._ndbuffer_stub import from_ndbuffer_row_major
 from std.memory import bitcast
 from std.gpu.sync import named_barrier
@@ -1483,6 +1484,342 @@ fn block_scaled_matmul[
             tensor_sf,
             ctx,
         )
+
+
+fn naive_grouped_block_scaled_mxfp4_matmul[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_dtype: DType,
+    offsets_type: DType,
+    expert_ids_type: DType,
+    expert_scales_type: DType,
+    c_layout: Layout,
+    a_layout: Layout,
+    b_layout: Layout,
+    a_scales_layout: Layout,
+    b_scales_layout: Layout,
+    offsets_layout: Layout,
+    expert_ids_layout: Layout,
+    expert_scales_layout: Layout,
+](
+    c: LayoutTensor[c_type, c_layout, MutAnyOrigin],
+    a: LayoutTensor[a_type, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[b_type, b_layout, ImmutAnyOrigin],
+    a_scales: LayoutTensor[scales_dtype, a_scales_layout, ImmutAnyOrigin],
+    b_scales: LayoutTensor[scales_dtype, b_scales_layout, ImmutAnyOrigin],
+    expert_start_indices: LayoutTensor[
+        offsets_type, offsets_layout, ImmutAnyOrigin
+    ],
+    expert_ids: LayoutTensor[
+        expert_ids_type, expert_ids_layout, ImmutAnyOrigin
+    ],
+    expert_scales: LayoutTensor[
+        expert_scales_type, expert_scales_layout, ImmutAnyOrigin
+    ],
+    max_num_tokens_per_expert: Int,
+    num_active_experts: Int,
+    ctx: DeviceContext,
+    block_dim_n: Int = 32,
+    block_dim_m: Int = 16,
+) raises:
+    comptime assert a_type == DType.uint8 and b_type == DType.uint8, (
+        "grouped MXFP4 matmul expects uint8 packed activations and weights"
+    )
+    comptime assert scales_dtype == MXFP4_SF_DTYPE, (
+        "grouped MXFP4 matmul expects float8_e8m0fnu scales"
+    )
+    comptime assert offsets_type == DType.uint32, (
+        "grouped MXFP4 matmul expects uint32 expert offsets"
+    )
+    comptime assert expert_ids_type == DType.int32, (
+        "grouped MXFP4 matmul expects int32 expert ids"
+    )
+    comptime assert expert_scales_type == DType.float32, (
+        "grouped MXFP4 matmul expects float32 expert scales"
+    )
+
+    if max_num_tokens_per_expert <= 0 or num_active_experts <= 0:
+        return
+
+    var launch_block_dim_n = max(1, block_dim_n)
+    var launch_block_dim_m = max(1, block_dim_m)
+    logger.info("Executing single-launch grouped MXFP4 GEMM")
+    comptime kernel = naive_grouped_block_scaled_mxfp4_matmul_kernel[
+        c_type,
+        a_type,
+        b_type,
+        scales_dtype,
+        offsets_type,
+        expert_ids_type,
+        expert_scales_type,
+        c_layout,
+        a_layout,
+        b_layout,
+        a_scales_layout,
+        b_scales_layout,
+        offsets_layout,
+        expert_ids_layout,
+        expert_scales_layout,
+    ]
+
+    ctx.enqueue_function[kernel, kernel](
+        c,
+        a,
+        b,
+        expert_start_indices,
+        expert_ids,
+        a_scales,
+        b_scales,
+        expert_scales,
+        Int32(num_active_experts),
+        grid_dim=(
+            ceildiv(c.dim(1), launch_block_dim_n),
+            ceildiv(max_num_tokens_per_expert, launch_block_dim_m),
+            num_active_experts,
+        ),
+        block_dim=(launch_block_dim_n, launch_block_dim_m, 1),
+    )
+
+
+fn naive_grouped_block_scaled_mxfp4_matmul_kernel[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    scales_dtype: DType,
+    offsets_type: DType,
+    expert_ids_type: DType,
+    expert_scales_type: DType,
+    c_layout: Layout,
+    a_layout: Layout,
+    b_layout: Layout,
+    a_scales_layout: Layout,
+    b_scales_layout: Layout,
+    offsets_layout: Layout,
+    expert_ids_layout: Layout,
+    expert_scales_layout: Layout,
+](
+    c: LayoutTensor[c_type, c_layout, MutAnyOrigin],
+    a: LayoutTensor[a_type, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[b_type, b_layout, ImmutAnyOrigin],
+    expert_start_indices: LayoutTensor[
+        offsets_type, offsets_layout, ImmutAnyOrigin
+    ],
+    expert_ids: LayoutTensor[
+        expert_ids_type, expert_ids_layout, ImmutAnyOrigin
+    ],
+    a_scales: LayoutTensor[scales_dtype, a_scales_layout, ImmutAnyOrigin],
+    b_scales: LayoutTensor[scales_dtype, b_scales_layout, ImmutAnyOrigin],
+    expert_scales: LayoutTensor[
+        expert_scales_type, expert_scales_layout, ImmutAnyOrigin
+    ],
+    num_active_experts: Int32,
+):
+    comptime accum_type = DType.float32
+    var n = Int(global_idx.x)
+    var m_local = Int(global_idx.y)
+    var group_idx = Int(block_idx.z)
+
+    if group_idx >= Int(num_active_experts):
+        return
+
+    var total_tokens = min(Int(a.dim(0)), Int(c.dim(0)))
+    var start = Int(
+        rebind[Scalar[offsets_type]](expert_start_indices[group_idx])
+    )
+    var stop = Int(
+        rebind[Scalar[offsets_type]](expert_start_indices[group_idx + 1])
+    )
+    start = min(start, total_tokens)
+    stop = min(stop, total_tokens)
+    if stop < start:
+        stop = start
+
+    var m_global = start + m_local
+    var n_dim = Int(c.dim(1))
+    if n >= n_dim or m_global >= stop:
+        return
+
+    var expert_id = Int(rebind[Scalar[expert_ids_type]](expert_ids[group_idx]))
+    if (
+        expert_id < 0
+        or expert_id >= Int(b.dim(0))
+        or expert_id >= Int(b_scales.dim(0))
+        or expert_id >= Int(expert_scales.dim(0))
+    ):
+        c[m_global, n] = Scalar[accum_type](0.0).cast[c_type]()
+        return
+
+    var accum = Scalar[accum_type](0.0)
+    var k_packed = Int(a.dim(1))
+    var k_dim = k_packed * 2
+    comptime K_SCALE_GROUP = MXFP4_SF_VECTOR_SIZE
+    comptime BYTES_PER_SCALE_GROUP = K_SCALE_GROUP // 2
+    var full_scale_groups = k_dim // K_SCALE_GROUP
+    for scale_group in range(full_scale_groups):
+        var k_group = scale_group * K_SCALE_GROUP
+        var a_scale = get_scale_factor[SF_VECTOR_SIZE=MXFP4_SF_VECTOR_SIZE](
+            a_scales, m_global, k_group
+        ).cast[accum_type]()
+        var b_scale = get_batched_scale_factor[
+            SF_VECTOR_SIZE=MXFP4_SF_VECTOR_SIZE
+        ](b_scales, expert_id, n, k_group).cast[accum_type]()
+        var scale = abs(rebind[Scalar[accum_type]](a_scale)) * abs(
+            rebind[Scalar[accum_type]](b_scale)
+        )
+
+        var byte_start = scale_group * BYTES_PER_SCALE_GROUP
+        comptime for byte_off in range(BYTES_PER_SCALE_GROUP):
+            var byte_idx = byte_start + byte_off
+            var a_vals = cast_f4e2m1x2_to_fp16x2(
+                rebind[UInt8](a[m_global, byte_idx])
+            ).cast[accum_type]()
+            var b_vals = cast_f4e2m1x2_to_fp16x2(
+                rebind[UInt8](b[expert_id, n, byte_idx])
+            ).cast[accum_type]()
+            accum += (
+                rebind[Scalar[accum_type]](a_vals[0])
+                * rebind[Scalar[accum_type]](b_vals[0])
+                + rebind[Scalar[accum_type]](a_vals[1])
+                * rebind[Scalar[accum_type]](b_vals[1])
+            ) * scale
+
+    var rem_k = k_dim - full_scale_groups * K_SCALE_GROUP
+    if rem_k > 0:
+        var k_group = full_scale_groups * K_SCALE_GROUP
+        var a_scale = get_scale_factor[SF_VECTOR_SIZE=MXFP4_SF_VECTOR_SIZE](
+            a_scales, m_global, k_group
+        ).cast[accum_type]()
+        var b_scale = get_batched_scale_factor[
+            SF_VECTOR_SIZE=MXFP4_SF_VECTOR_SIZE
+        ](b_scales, expert_id, n, k_group).cast[accum_type]()
+        var scale = abs(rebind[Scalar[accum_type]](a_scale)) * abs(
+            rebind[Scalar[accum_type]](b_scale)
+        )
+        var byte_start = full_scale_groups * BYTES_PER_SCALE_GROUP
+        var rem_bytes = rem_k // 2
+        for byte_off in range(rem_bytes):
+            var byte_idx = byte_start + byte_off
+            var a_vals = cast_f4e2m1x2_to_fp16x2(
+                rebind[UInt8](a[m_global, byte_idx])
+            ).cast[accum_type]()
+            var b_vals = cast_f4e2m1x2_to_fp16x2(
+                rebind[UInt8](b[expert_id, n, byte_idx])
+            ).cast[accum_type]()
+            accum += (
+                rebind[Scalar[accum_type]](a_vals[0])
+                * rebind[Scalar[accum_type]](b_vals[0])
+                + rebind[Scalar[accum_type]](a_vals[1])
+                * rebind[Scalar[accum_type]](b_vals[1])
+            ) * scale
+
+    var expert_scale = rebind[Scalar[expert_scales_type]](
+        expert_scales[expert_id]
+    ).cast[accum_type]()
+    accum *= rebind[Scalar[accum_type]](expert_scale)
+    c[m_global, n] = accum.cast[c_type]()
+
+fn grouped_matmul_dynamic_scaled_mxfp4[
+    c_type: DType,
+    c_shape: DimList,
+    a_type: DType,
+    a_shape: DimList,
+    b_type: DType,
+    b_shape: DimList,
+    scales_dtype: DType,
+    a_scales_shape: DimList,
+    b_scales_shape: DimList,
+    //,
+    target: StaticString = "cpu",
+](
+    c: NDBuffer[mut=True, c_type, 2, MutAnyOrigin, c_shape],
+    a: NDBuffer[a_type, 2, ImmutAnyOrigin, a_shape],
+    b: NDBuffer[b_type, 3, ImmutAnyOrigin, b_shape],
+    a_scales: NDBuffer[scales_dtype, 5, ImmutAnyOrigin, a_scales_shape],
+    b_scales: NDBuffer[scales_dtype, 6, ImmutAnyOrigin, b_scales_shape],
+    expert_start_indices: NDBuffer[DType.uint32, 1, ImmutAnyOrigin, _],
+    expert_ids: NDBuffer[DType.int32, 1, ImmutAnyOrigin, _],
+    _a_scale_offsets: NDBuffer[DType.uint32, 1, ImmutAnyOrigin, _],
+    expert_scales: NDBuffer[DType.float32, 1, ImmutAnyOrigin, _],
+    max_num_tokens_per_expert: Int,
+    num_active_experts: Int,
+    ctx: DeviceContext,
+) raises:
+    """Single-launch grouped MXFP4 matmul path for non-tcgen05 systems."""
+    if num_active_experts <= 0:
+        return
+
+    var max_groups = num_active_experts
+    var start_count = Int(expert_start_indices.dim[0]())
+    if start_count <= 1:
+        return
+    max_groups = min(max_groups, start_count - 1)
+    max_groups = min(max_groups, Int(expert_ids.dim[0]()))
+    if max_groups <= 0:
+        return
+
+    var max_tokens = max_num_tokens_per_expert
+    if max_tokens <= 0:
+        var total_tokens = UInt32(a.dim[0]())
+        max_tokens = 0
+        for i in range(max_groups):
+            var token_start = rebind[Scalar[DType.uint32]](expert_start_indices[i])
+            var token_end = rebind[Scalar[DType.uint32]](
+                expert_start_indices[i + 1]
+            )
+            if token_start > total_tokens:
+                token_start = total_tokens
+            if token_end > total_tokens:
+                token_end = total_tokens
+            if token_end < token_start:
+                token_end = token_start
+            max_tokens = max(max_tokens, Int(token_end - token_start))
+    if max_tokens <= 0:
+        return
+
+    var c_tensor = from_ndbuffer_row_major(c).as_any_origin()
+    var a_tensor = from_ndbuffer_row_major(a).as_any_origin()
+    var b_tensor = from_ndbuffer_row_major(b).as_any_origin()
+    var a_scales_tensor = from_ndbuffer_row_major(a_scales).as_any_origin()
+    var b_scales_tensor = from_ndbuffer_row_major(b_scales).as_any_origin()
+    var expert_start_tensor = from_ndbuffer_row_major(
+        expert_start_indices
+    ).as_any_origin()
+    var expert_ids_tensor = from_ndbuffer_row_major(expert_ids).as_any_origin()
+    var expert_scales_tensor = from_ndbuffer_row_major(expert_scales).as_any_origin()
+
+    # Decode-heavy MoE tends to have very small M-per-expert. Use a tile shape
+    # that reduces wasted threads when max_tokens is small.
+    var block_dim_n = 32
+    var block_dim_m = 16
+    if max_tokens <= 1:
+        block_dim_n = 128
+        block_dim_m = 1
+    elif max_tokens <= 2:
+        block_dim_n = 128
+        block_dim_m = 2
+    elif max_tokens <= 4:
+        block_dim_n = 128
+        block_dim_m = 4
+    elif max_tokens <= 8:
+        block_dim_n = 64
+        block_dim_m = 8
+
+    naive_grouped_block_scaled_mxfp4_matmul(
+        c_tensor,
+        a_tensor,
+        b_tensor,
+        a_scales_tensor,
+        b_scales_tensor,
+        expert_start_tensor,
+        expert_ids_tensor,
+        expert_scales_tensor,
+        max_tokens,
+        max_groups,
+        ctx,
+        block_dim_n,
+        block_dim_m,
+    )
 
 
 ########################################################
