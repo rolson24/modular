@@ -1544,7 +1544,6 @@ fn naive_grouped_block_scaled_mxfp4_matmul[
 
     var launch_block_dim_n = max(1, block_dim_n)
     var launch_block_dim_m = max(1, block_dim_m)
-    logger.info("Executing single-launch grouped MXFP4 GEMM")
     comptime kernel = naive_grouped_block_scaled_mxfp4_matmul_kernel[
         c_type,
         a_type,

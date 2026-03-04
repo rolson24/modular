@@ -47,12 +47,9 @@ comptime CUDA_CUBLAS_LIBRARY_PATHS: List[Path] = [
     "/usr/local/cuda-13.1/lib64/libcublas.so.13",
     "/usr/local/cuda-13.0/lib64/libcublas.so.13",
     "/usr/local/cuda/lib64/libcublas.so.13",
-    "/usr/local/lib/ollama/cuda_v13/libcublas.so.13",
-    "/usr/local/lib/ollama/mlx_cuda_v13/libcublas.so.13",
     "libcublas.so.12",
     "/usr/local/cuda-12.8/lib64/libcublas.so.12",
     "/usr/local/cuda/lib64/libcublas.so.12",
-    "/usr/local/lib/ollama/cuda_v12/libcublas.so.12",
 ]
 
 
