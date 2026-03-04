@@ -136,7 +136,6 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
             )
             attn_dtype = config.dtype if attn_quantized else DType.bfloat16
             mlp_dtype = config.dtype if mlp_quantized else DType.bfloat16
-            attn_cfg = layer_quant_config if attn_quantized else None
             mlp_cfg = layer_quant_config if mlp_quantized else None
 
             layers.append(
@@ -155,7 +154,6 @@ class GptOssTextModel(DistributedLogitsPostprocessMixin, Module):
                         layer_type=config.layer_types[i]
                         if i < len(config.layer_types)
                         else "full_attention",
-                        float8_config=attn_cfg,
                     ),
                     mlp=GptOssMoE(
                         config,

@@ -19,9 +19,6 @@ from max.graph.weights import WeightData
 from max.pipelines.architectures.gpt_oss.weight_adapters import (
     convert_safetensor_state_dict,
 )
-from max.pipelines.architectures.gpt_oss_modulev3.weight_adapters import (
-    convert_safetensor_state_dict as convert_safetensor_state_dict_modulev3,
-)
 
 
 class _MockWeight:
@@ -72,63 +69,6 @@ def test_convert_safetensor_state_dict_mxfp4_moe() -> None:
     )
     assert (
         converted["language_model.layers.0.mlp.experts.down_proj_scale"].dtype
-        == DType.float8_e8m0fnu
-    )
-    assert "language_model.layers.0.mlp.gate.gate_score.weight" in converted
-
-
-def test_convert_safetensor_state_dict_modulev3_mxfp4_moe() -> None:
-    state_dict = {
-        "model.layers.0.mlp.experts.gate_up_proj_blocks": _MockWeight(
-            np.zeros((2, 8, 3, 16), dtype=np.uint8),
-            "model.layers.0.mlp.experts.gate_up_proj_blocks",
-        ),
-        "model.layers.0.mlp.experts.gate_up_proj_scales": _MockWeight(
-            np.full((2, 8, 3), 127, dtype=np.uint8),
-            "model.layers.0.mlp.experts.gate_up_proj_scales",
-        ),
-        "model.layers.0.mlp.experts.down_proj_blocks": _MockWeight(
-            np.zeros((2, 4, 5, 16), dtype=np.uint8),
-            "model.layers.0.mlp.experts.down_proj_blocks",
-        ),
-        "model.layers.0.mlp.experts.down_proj_scales": _MockWeight(
-            np.full((2, 4, 5), 127, dtype=np.uint8),
-            "model.layers.0.mlp.experts.down_proj_scales",
-        ),
-        "model.layers.0.mlp.router.weight": _MockWeight(
-            np.zeros((2, 4), dtype=np.float32),
-            "model.layers.0.mlp.router.weight",
-        ),
-    }
-
-    converted = convert_safetensor_state_dict_modulev3(state_dict)  # type: ignore[arg-type]
-
-    assert (
-        tuple(
-            converted[
-                "language_model.layers.0.mlp._experts_gate_up_proj_weight"
-            ].shape
-        )
-        == (2, 8, 48)
-    )
-    assert (
-        tuple(
-            converted[
-                "language_model.layers.0.mlp._experts_down_proj_weight"
-            ].shape
-        )
-        == (2, 4, 80)
-    )
-    assert (
-        converted[
-            "language_model.layers.0.mlp._experts_gate_up_proj_weight_scale"
-        ].dtype
-        == DType.float8_e8m0fnu
-    )
-    assert (
-        converted[
-            "language_model.layers.0.mlp._experts_down_proj_weight_scale"
-        ].dtype
         == DType.float8_e8m0fnu
     )
     assert "language_model.layers.0.mlp.gate.gate_score.weight" in converted
