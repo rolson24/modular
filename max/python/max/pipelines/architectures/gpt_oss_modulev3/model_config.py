@@ -18,14 +18,12 @@ from dataclasses import dataclass
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.graph.weights import WeightData, WeightsFormat, weights_format
-from max.nn.float8_config import Float8Config
 from max.nn.kv_cache import KVCacheParams
 from max.nn.rotary_embedding import YarnScalingParams
 from max.nn.transformer import ReturnLogits
 from max.pipelines.lib import KVCacheConfig, PipelineConfig
 from max.pipelines.lib.config.config_enums import supported_encoding_dtype
 from max.pipelines.lib.interfaces.arch_config import ArchConfigWithKVCache
-from max.pipelines.lib.float8 import parse_float8_config
 from transformers import AutoConfig
 from typing_extensions import Self, override
 
@@ -126,9 +124,6 @@ class GptOssConfig(ArchConfigWithKVCache):
 
     kv_params: KVCacheParams
     """KV cache parameters."""
-
-    float8_config: Float8Config | None = None
-    """Optional float8/float4 quantization config parsed from weights."""
 
     tie_word_embeddings: bool = False
     """Whether to tie weight embeddings. When true, the output linear layer
@@ -322,9 +317,7 @@ class GptOssConfig(ArchConfigWithKVCache):
             num_key_value_heads=huggingface_config.num_key_value_heads,
             head_dim=huggingface_config.head_dim,
             hidden_activation=hidden_activation,
-            max_position_embeddings=cls.calculate_max_seq_len(
-                pipeline_config, huggingface_config
-            ),
+            max_position_embeddings=huggingface_config.max_position_embeddings,
             rms_norm_eps=huggingface_config.rms_norm_eps,
             rope_theta=huggingface_config.rope_theta,
             attention_bias=huggingface_config.attention_bias,
@@ -366,34 +359,14 @@ class GptOssConfig(ArchConfigWithKVCache):
             state_dict: The model's state dictionary containing weights.
             return_logits: Whether to return the last token, all tokens or a variable number of logits.
         """
-        if any(k.startswith("language_model.") for k in state_dict):
-            normalized_state_dict = {
-                k.removeprefix("language_model."): v
-                for k, v in state_dict.items()
-                if k.startswith("language_model.")
-            }
-        elif any(k.startswith("model.") for k in state_dict):
-            normalized_state_dict = {
-                k.removeprefix("model."): v
-                for k, v in state_dict.items()
-                if k.startswith("model.")
-            }
-        else:
-            normalized_state_dict = dict(state_dict)
-
-        float8_config = parse_float8_config(
-            huggingface_config, normalized_state_dict, self.dtype
-        )
-
         # When tie_word_embeddings=True, the embedding weights are shared with
         # the output weights.
         tie_word_embeddings = (
             getattr(huggingface_config, "tie_word_embeddings", False)
-            or "lm_head.weight" not in normalized_state_dict
+            or "language_model.lm_head.weight" not in state_dict
         )
 
         self.tie_word_embeddings = tie_word_embeddings
-        self.float8_config = float8_config
         self.return_logits = return_logits
 
 
